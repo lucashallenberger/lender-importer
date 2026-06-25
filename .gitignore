@@ -1,0 +1,11 @@
+config.ini
+learned.json
+fields.txt
+.venv/
+__pycache__/
+*.pyc
+*.log
+build/
+dist/
+*.spec
+.DS_Store

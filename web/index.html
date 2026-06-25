@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lender Importer</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><span class="dot"></span> Lender Importer</div>
+  <div id="conn" class="conn">Not connected</div>
+</header>
+
+<div class="steps" id="steps">
+  <div class="step" data-step="setup"><span class="num">1</span> Set up</div>
+  <div class="sep"></div>
+  <div class="step" data-step="questions"><span class="num">2</span> Review</div>
+  <div class="sep"></div>
+  <div class="step" data-step="review"><span class="num">3</span> Upload</div>
+</div>
+
+<main>
+  <!-- Settings / first run -->
+  <section id="screen-settings" class="screen hidden">
+    <h2>Connect to Salesforce</h2>
+    <p class="muted small">Entered once and saved on this computer. Get a security token from
+      Salesforce → Settings → Reset My Security Token.</p>
+    <label>Username (email)</label>
+    <input id="s-user" type="email" placeholder="you@company.com" />
+    <label>Password</label>
+    <input id="s-pass" type="password" />
+    <label>Security token</label>
+    <input id="s-token" type="text" />
+    <label>Org / domain</label>
+    <input id="s-domain" type="text" placeholder="login, test, or yourco.my.salesforce.com" value="login" />
+    <div class="row end">
+      <span id="s-msg" class="msg"></span>
+      <button id="s-save" class="primary">Save &amp; connect</button>
+    </div>
+  </section>
+
+  <!-- Step 1a: file -->
+  <section id="screen-file" class="screen hidden">
+    <h2>Choose your Excel file</h2>
+    <p class="muted small">The sheet needs columns: Account, Contact, Notes, Interest.</p>
+    <div id="dropzone" class="dropzone">
+      <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5M5 20h14"/></svg></span>
+      <div id="file-label">No file chosen yet</div>
+      <div id="file-sub" class="muted small">Pick the lender list to import</div>
+      <button id="pick" class="ghost">Choose file…</button>
+    </div>
+    <div id="sheet-row" class="field hidden">
+      <label>Sheet</label>
+      <input id="sheet" type="text" value="2" />
+      <span class="muted small">name or number (your data is on Sheet 2)</span>
+    </div>
+    <div class="row end">
+      <span id="file-msg" class="msg"></span>
+      <button id="to-deal" class="primary" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- Step 1b: deal -->
+  <section id="screen-deal" class="screen hidden">
+    <h2>Which deal?</h2>
+    <p class="muted small">Every lender in the file will be attached to this one deal.</p>
+    <input id="deal-q" type="text" placeholder="Type part of the deal name…" autocomplete="off" />
+    <div id="deal-results" class="results"></div>
+    <div id="deal-chosen" class="chosen hidden"></div>
+    <div class="row split">
+      <button id="deal-back" class="ghost">Back</button>
+      <button id="to-property" class="primary" disabled>Next</button>
+    </div>
+  </section>
+
+  <!-- Step 1c: property -->
+  <section id="screen-property" class="screen hidden">
+    <h2>Property name</h2>
+    <p class="muted small">Used to build each record's name, as “Lender - Property”.</p>
+    <label>Property</label>
+    <input id="property" type="text" placeholder="e.g. 1234 Main" />
+    <span id="name-preview" class="muted small"></span>
+    <div class="row split">
+      <button id="prop-back" class="ghost">Back</button>
+      <button id="analyze" class="primary" disabled>Analyze</button>
+    </div>
+  </section>
+
+  <!-- Step 2: questions -->
+  <section id="screen-questions" class="screen hidden">
+    <h2 id="q-title">A few things to confirm</h2>
+    <p class="muted small" id="q-progress"></p>
+    <div id="q-card"></div>
+  </section>
+
+  <!-- Step 3: review -->
+  <section id="screen-review" class="screen hidden">
+    <h2>Ready to upload</h2>
+    <div id="deal-line" class="muted small"></div>
+    <div id="metrics" class="metrics"></div>
+    <div id="preview"></div>
+    <div class="row split">
+      <button id="back-setup" class="ghost">Start over</button>
+      <button id="upload" class="primary success">Upload to Salesforce</button>
+    </div>
+  </section>
+
+  <!-- Done -->
+  <section id="screen-done" class="screen hidden">
+    <div id="done-box"></div>
+    <div class="row end"><button id="another" class="primary">Import another</button></div>
+  </section>
+</main>
+
+<div id="overlay" class="overlay hidden"><div class="spinner"></div><div id="overlay-text" class="overlay-text">Working…</div></div>
+
+<script src="app.js"></script>
+</body>
+</html>

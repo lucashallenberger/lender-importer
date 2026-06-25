@@ -1,0 +1,40 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:        # lets you run it manually from the Actions tab
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pythonnet
+
+      - name: Build LenderImporter.exe
+        run: >
+          pyinstaller --noconfirm --windowed --onefile
+          --name LenderImporter
+          --add-data "web;web"
+          --collect-all webview
+          --collect-submodules simple_salesforce
+          --hidden-import app_paths
+          --hidden-import src.sf_client
+          app.py
+
+      - name: Upload the built app
+        uses: actions/upload-artifact@v4
+        with:
+          name: LenderImporter-windows
+          path: dist/LenderImporter.exe
+          if-no-files-found: error
