@@ -9,6 +9,7 @@ Flow the UI drives:
 
 import io
 import contextlib
+import configparser
 import os
 
 import import_lenders as il
@@ -61,6 +62,27 @@ class Api:
         self.sf = _silent(connect, cfg)
         self.api_name = get_object_api_name(cfg) or "ascendix__DealSource__c"
         self.desc = il.describe_object(self.sf, self.api_name)
+
+    def connect_with(self, username, password, security_token, domain):
+        """Connect using credentials supplied at runtime (web login form).
+        Nothing is written to disk - the session lives only on this Api instance."""
+        cfg = configparser.ConfigParser()
+        cfg["salesforce"] = {
+            "username": username or "", "password": password or "",
+            "security_token": security_token or "", "domain": domain or "login",
+        }
+        cfg["object"] = {"api_name": os.environ.get("SF_OBJECT", "ascendix__DealSource__c")}
+        try:
+            self.sf = _silent(connect, cfg)
+            self.api_name = cfg["object"]["api_name"]
+            self.desc = il.describe_object(self.sf, self.api_name)
+            return {"ok": True, "object": self.api_name}
+        except SystemExit as e:
+            self.sf = None
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            self.sf = None
+            return {"ok": False, "error": str(e)}
 
     # ---- inputs -------------------------------------------------------------
     def load_excel(self, path, sheet=None):

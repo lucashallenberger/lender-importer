@@ -1,33 +1,14 @@
 """Lender Importer — Streamlit page.
 
 Reuses core.Api (the Salesforce + Excel + matching logic) unchanged; this module
-only provides the web UI. Gated behind an app password (APP_PASSWORD secret).
-Salesforce credentials come from Replit Secrets via src/sf_client (env-aware).
+only provides the web UI. Each user signs into Salesforce in the app; the session
+is held only in st.session_state (lives while the browser tab is open) and nothing
+is written to the server. That Salesforce login is itself the access gate.
 """
 
-import os
 import streamlit as st
 
 from core import Api
-
-
-# ── login gate ────────────────────────────────────────────────────────────
-def _gate() -> bool:
-    if st.session_state.get("lender_authed"):
-        return True
-    st.subheader("Sign in")
-    expected = os.environ.get("APP_PASSWORD", "")
-    if not expected:
-        st.error("APP_PASSWORD is not set. Add it in Replit Secrets to enable this tool.")
-        return False
-    pw = st.text_input("App password", type="password")
-    if st.button("Unlock", type="primary"):
-        if pw == expected:
-            st.session_state["lender_authed"] = True
-            st.rerun()
-        else:
-            st.error("Wrong password.")
-    return False
 
 
 def _api() -> Api:
@@ -37,23 +18,43 @@ def _api() -> Api:
 
 
 def _reset():
-    for k in ("lender_api", "lender_stage", "lender_analyze", "lender_deal", "lender_prop"):
+    """Reset the import flow but keep the Salesforce session (stay signed in)."""
+    for k in ("lender_stage", "lender_analyze", "lender_deal", "lender_prop"):
         st.session_state.pop(k, None)
+
+
+def _login(api):
+    st.subheader("Sign in to Salesforce")
+    st.caption("Kept only for this browser tab — nothing is saved on the server. "
+               "Need a token? Salesforce → Settings → Reset My Security Token.")
+    u = st.text_input("Username (email)")
+    p = st.text_input("Password", type="password")
+    t = st.text_input("Security token")
+    d = st.text_input("Org / domain", value="ascendixre-1500.my.salesforce.com")
+    if st.button("Sign in", type="primary"):
+        with st.spinner("Connecting to Salesforce…"):
+            r = api.connect_with(u, p, t, d)
+        if r["ok"]:
+            st.session_state["lender_user"] = u
+            st.rerun()
+        else:
+            st.error(r["error"])
 
 
 # ── pages ─────────────────────────────────────────────────────────────────
 def render():
     st.header("Lender Importer")
-    if not _gate():
-        return
     api = _api()
-    try:
-        api.connect()
-    except SystemExit as e:
-        st.error(str(e)); return
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Salesforce connection failed: {e}"); return
-    st.caption(f"Connected · {api.api_name}")
+    if api.sf is None:                       # not signed in this session yet
+        _login(api)
+        return
+    c1, c2 = st.columns([4, 1])
+    c1.caption(f"Signed in as {st.session_state.get('lender_user', '?')} · {api.api_name}")
+    if c2.button("Sign out"):
+        for k in list(st.session_state.keys()):
+            if k.startswith("lender_"):
+                st.session_state.pop(k, None)
+        st.rerun()
 
     stage = st.session_state.setdefault("lender_stage", "setup")
     {"setup": _setup, "questions": _questions, "review": _review, "done": _done}[stage](api)
