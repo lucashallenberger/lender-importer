@@ -6,3 +6,4 @@ pandas
 pytesseract
 pillow
 simple-salesforce>=1.12
+streamlit-local-storage

@@ -6,9 +6,14 @@ is held only in st.session_state (lives while the browser tab is open) and nothi
 is written to the server. That Salesforce login is itself the access gate.
 """
 
+import base64
+import json
+
 import streamlit as st
 
 from core import Api
+
+STORE_KEY = "lender_login"
 
 
 def _api() -> Api:
@@ -17,44 +22,98 @@ def _api() -> Api:
     return st.session_state["lender_api"]
 
 
+def _storage():
+    """Browser localStorage handle for 'remember me' (optional; None if unavailable)."""
+    try:
+        from streamlit_local_storage import LocalStorage
+        return LocalStorage()
+    except Exception:
+        return None
+
+
+def _encode(d):
+    return base64.b64encode(json.dumps(d).encode()).decode()
+
+
+def _decode(s):
+    try:
+        return json.loads(base64.b64decode(s).decode())
+    except Exception:
+        return None
+
+
+def _try_remembered(api, ls):
+    """If a saved login exists in the browser, sign in with it automatically."""
+    if ls is None or st.session_state.get("lender_tried_remember"):
+        return
+    st.session_state["lender_tried_remember"] = True
+    blob = ls.getItem(STORE_KEY)
+    creds = _decode(blob) if blob else None
+    if creds:
+        r = api.connect_with(creds.get("username"), creds.get("password"),
+                             creds.get("security_token"), creds.get("domain"))
+        if r["ok"]:
+            st.session_state["lender_user"] = creds.get("username")
+            st.rerun()
+        else:
+            ls.deleteItem(STORE_KEY)   # stale (password/token changed)
+
+
 def _reset():
     """Reset the import flow but keep the Salesforce session (stay signed in)."""
     for k in ("lender_stage", "lender_analyze", "lender_deal", "lender_prop"):
         st.session_state.pop(k, None)
 
 
-def _login(api):
+def _login(api, ls):
     st.subheader("Sign in to Salesforce")
-    st.caption("Kept only for this browser tab — nothing is saved on the server. "
-               "Need a token? Salesforce → Settings → Reset My Security Token.")
+    st.caption("Need a token? Salesforce → Settings → Reset My Security Token.")
     u = st.text_input("Username (email)")
     p = st.text_input("Password", type="password")
     t = st.text_input("Security token")
     d = st.text_input("Org / domain", value="ascendixre-1500.my.salesforce.com")
+    remember = st.checkbox("Remember me on this computer", value=False,
+                           help="Saves your login in this browser so a refresh won't sign you out. "
+                                "Only use on your own machine.")
     if st.button("Sign in", type="primary"):
         with st.spinner("Connecting to Salesforce…"):
             r = api.connect_with(u, p, t, d)
         if r["ok"]:
             st.session_state["lender_user"] = u
+            if remember and ls is not None:
+                ls.setItem(STORE_KEY, _encode(
+                    {"username": u, "password": p, "security_token": t, "domain": d}))
             st.rerun()
         else:
             st.error(r["error"])
+
+
+def _sign_out(ls):
+    if ls is not None:
+        try:
+            ls.deleteItem(STORE_KEY)
+        except Exception:
+            pass
+    for k in list(st.session_state.keys()):
+        if k.startswith("lender_"):
+            st.session_state.pop(k, None)
+    st.rerun()
 
 
 # ── pages ─────────────────────────────────────────────────────────────────
 def render():
     st.header("Lender Importer")
     api = _api()
+    ls = _storage()
     if api.sf is None:                       # not signed in this session yet
-        _login(api)
+        _try_remembered(api, ls)             # auto sign-in from saved login, if any
+    if api.sf is None:
+        _login(api, ls)
         return
     c1, c2 = st.columns([4, 1])
     c1.caption(f"Signed in as {st.session_state.get('lender_user', '?')} · {api.api_name}")
     if c2.button("Sign out"):
-        for k in list(st.session_state.keys()):
-            if k.startswith("lender_"):
-                st.session_state.pop(k, None)
-        st.rerun()
+        _sign_out(ls)
 
     stage = st.session_state.setdefault("lender_stage", "setup")
     {"setup": _setup, "questions": _questions, "review": _review, "done": _done}[stage](api)
