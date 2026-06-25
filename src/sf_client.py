@@ -15,8 +15,24 @@ def _config_path():
     return data_file("config.ini")
 
 
+def _env_config():
+    """Build a config from environment variables (Replit Secrets), or None.
+    Used by the web/server deploy where there's no config.ini on disk."""
+    if not os.environ.get("SF_USERNAME"):
+        return None
+    cfg = configparser.ConfigParser()
+    cfg["salesforce"] = {
+        "username": os.environ["SF_USERNAME"],
+        "password": os.environ.get("SF_PASSWORD", ""),
+        "security_token": os.environ.get("SF_TOKEN", ""),
+        "domain": os.environ.get("SF_DOMAIN", "login"),
+    }
+    cfg["object"] = {"api_name": os.environ.get("SF_OBJECT", "ascendix__DealSource__c")}
+    return cfg
+
+
 def config_exists():
-    return os.path.exists(_config_path())
+    return _env_config() is not None or os.path.exists(_config_path())
 
 
 def save_config(username, password, security_token, domain, api_name=""):
@@ -32,12 +48,16 @@ def save_config(username, password, security_token, domain, api_name=""):
 
 
 def load_config():
+    # Environment (Replit Secrets) wins, so the web deploy needs no config.ini.
+    env = _env_config()
+    if env is not None:
+        return env
     path = _config_path()
     if not os.path.exists(path):
         sys.exit(
-            "ERROR: config.ini not found.\n"
-            "  Copy config.example.ini to config.ini and fill in your "
-            "Salesforce login details first."
+            "ERROR: no Salesforce credentials found.\n"
+            "  Web deploy: set SF_USERNAME / SF_PASSWORD / SF_TOKEN / SF_DOMAIN secrets.\n"
+            "  Local: copy config.example.ini to config.ini and fill it in."
         )
     cfg = configparser.ConfigParser()
     cfg.read(path)

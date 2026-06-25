@@ -76,6 +76,20 @@ class Api:
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": str(e)}
 
+    def load_excel_bytes(self, data, filename, sheet=None):
+        """Same as load_excel but from in-memory bytes (Streamlit st.file_uploader)."""
+        try:
+            self.connect()
+            headers, records = il.read_excel(io.BytesIO(data), sheet)
+            _silent(il.validate_mapping, self.desc, headers)
+            self.headers, self.records, self.excel_name = headers, records, filename
+            return {"ok": True, "rows": len(records), "file": filename,
+                    "columns": [h for h in headers if h]}
+        except SystemExit as e:
+            return {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": str(e)}
+
     def search_deals(self, query):
         self.connect()
         target = {f["name"]: f for f in self.desc["fields"]}[DEAL_FIELD]["referenceTo"][0]

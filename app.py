@@ -1,43 +1,28 @@
-"""Desktop app entry point. Opens a native window rendering the web/ UI and
-exposes the core.Api methods to JavaScript via pywebview."""
+"""QCP Tools — combined Streamlit app.
 
-import os
-import sys
+A sidebar switches between two tools:
+  • Tax Bill Parser  — parse LA County secured property tax bill PDFs to Excel
+  • Lender Importer   — bulk-create Salesforce Deal Source records from a lender list
 
-import webview
+Run locally:  streamlit run app.py
+On Replit:    configured via .replit (streamlit run app.py ...)
+"""
 
-from core import Api
+import streamlit as st
 
+# Must be the first Streamlit call.
+st.set_page_config(page_title="QCP Tools", page_icon="🏢", layout="wide")
 
-def _resource(*parts):
-    """Path to bundled resources, working both from source and from a PyInstaller build."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, *parts)
+from tools import tax_parser, lender_importer  # noqa: E402
 
+PAGES = {
+    "Tax Bill Parser": tax_parser.render,
+    "Lender Importer": lender_importer.render,
+}
 
-class AppApi(Api):
-    """core.Api plus UI-only helpers that need the window (native file dialog)."""
+with st.sidebar:
+    st.markdown("## QCP Tools")
+    choice = st.radio("Choose a tool", list(PAGES.keys()), label_visibility="collapsed")
+    st.divider()
 
-    def pick_excel(self):
-        win = webview.windows[0]
-        result = win.create_file_dialog(
-            webview.OPEN_DIALOG, allow_multiple=False,
-            file_types=("Excel files (*.xlsx;*.xlsm)", "All files (*.*)"))
-        if not result:
-            return {"ok": False, "cancelled": True}
-        return self.load_excel(result[0], sheet=None) | {"path": result[0]}
-
-    def load_excel_sheet(self, path, sheet):
-        return self.load_excel(path, sheet=sheet)
-
-
-def main():
-    api = AppApi()
-    webview.create_window(
-        "Lender Importer", _resource("web", "index.html"),
-        js_api=api, width=760, height=820, min_size=(680, 700))
-    webview.start()
-
-
-if __name__ == "__main__":
-    main()
+PAGES[choice]()

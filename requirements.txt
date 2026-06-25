@@ -1,3 +1,8 @@
+streamlit
+pdfplumber
+openpyxl
+pymupdf
+pandas
+pytesseract
+pillow
 simple-salesforce>=1.12
-openpyxl>=3.1
-pywebview>=5.0

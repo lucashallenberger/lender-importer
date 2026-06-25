@@ -1,0 +1,9 @@
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8080
+maxUploadSize = 50
+
+[theme]
+base = "light"
+primaryColor = "#4f46e5"

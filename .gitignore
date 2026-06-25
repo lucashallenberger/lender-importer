@@ -9,3 +9,8 @@ build/
 dist/
 *.spec
 .DS_Store
+
+# merge/streamlit extras
+_tax_tool/
+dist_win/
+tools/data/
