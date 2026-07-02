@@ -13,11 +13,12 @@ import streamlit as st
 # Must be the first Streamlit call.
 st.set_page_config(page_title="QCP Tools", page_icon="🏢", layout="wide")
 
-from tools import tax_parser, lender_importer  # noqa: E402
+from tools import tax_parser, lender_importer, historicals  # noqa: E402
 
 PAGES = {
     "Tax Bill Parser": tax_parser.render,
     "Lender Importer": lender_importer.render,
+    "Historicals": historicals.render,
 }
 
 with st.sidebar:
