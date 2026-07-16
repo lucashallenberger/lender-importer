@@ -176,12 +176,12 @@ def parse_pdf(pdf_path: Path) -> dict:
     start = idx_map.get("direct_start", 0)
     end   = idx_map.get("taxable_start", len(lines))
     for line in lines[start+1:end]:
-        # Amount is always at end of line: e.g. "132.27" or ".93"
-        amount_match = re.search(r'\$?\s*(\d*\.\d{2})\s*$', line)
+        # Amount is always at end of line: e.g. "132.27", ".93", or "4,884.14"
+        amount_match = re.search(r'\$?\s*([\d,]*\.\d{2})\s*$', line)
         if not amount_match:
             continue
         try:
-            amount = float(amount_match.group(1))
+            amount = float(amount_match.group(1).replace(',', ''))
         except ValueError:
             continue
 
@@ -621,6 +621,93 @@ def make_xlsx(edited, shot_path):
     return Path(xlsx_path).read_bytes(), Path(xlsx_path).name
 
 
+BILL_WIDTH = 6   # 5 columns (A–E) + 1 spacer, for side-by-side layout
+
+
+def write_bill(ws, data, apn, c0=0, screenshot_path=None):
+    """Write one bill's block into worksheet `ws` starting at column 1+c0.
+    Same layout as build_excel (labels col, value col, screenshot), but offset so
+    multiple bills sit side by side. Returns the last row used."""
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.drawing.image import Image as XLImage
+    bold = Font(bold=True, name="Arial"); boldw = Font(bold=True, name="Arial", color="FFFFFF")
+    normal = Font(name="Arial"); dark = PatternFill("solid", fgColor="404040")
+    LC, VC = 1 + c0, 2 + c0
+    VL = get_column_letter(VC)
+
+    def cell(r, rel, value, is_bold=False, fmt=None):
+        c = ws.cell(r, rel + c0, value); c.font = bold if is_bold else normal
+        if fmt:
+            c.number_format = fmt
+        return c
+
+    def hcell(r, rel, value):
+        c = ws.cell(r, rel + c0, value); c.font = boldw; c.fill = dark; return c
+
+    def hfill(r):
+        for col in range(1 + c0, 6 + c0):
+            ws.cell(r, col).fill = dark
+
+    row = 1
+    raw = re.sub(r"[^0-9]", "", apn)[:10]
+    apnd = f"{raw[:4]}-{raw[4:7]}-{raw[7:10]}" if len(raw) >= 10 else raw
+    hcell(row, 1, "MILL RATE"); hfill(row); apn_row = row
+    ws.cell(row, VC, apnd).font = boldw; ws.cell(row, VC).fill = dark; row += 1
+    rs = row
+    for agency, rate in (data["mill_rates"] or []):
+        cell(row, 1, agency); cell(row, 2, rate / 100, fmt="0.00000000%"); row += 1
+    re_ = row - 1
+    cell(row, 1, "Total", True); cell(row, 2, f"=SUM({VL}{rs}:{VL}{re_})", True, "0.00000000%"); trate = row; row += 3
+
+    hcell(row, 1, "DIRECT ASSESSMENTS"); hfill(row)
+    ws.cell(row, VC, f"={VL}{apn_row}").font = boldw; ws.cell(row, VC).fill = dark; row += 1
+    ds = row
+    for name, amt in (data["direct_assessments"] or []):
+        cell(row, 1, name); cell(row, 2, amt, fmt="#,##0.00"); row += 1
+    de = row - 1
+    cell(row, 1, "Total", True); cell(row, 2, f"=SUM({VL}{ds}:{VL}{de})", True); tda = row; row += 3
+
+    hcell(row, 1, "TAXABLE VALUE"); hfill(row)
+    ws.cell(row, VC, f"={VL}{apn_row}").font = boldw; ws.cell(row, VC).fill = dark; row += 1
+    tv = data["taxable_value"]; lr = row
+    cell(row, 1, "Land"); (tv.get("land") is not None) and cell(row, 2, tv["land"], fmt="#,##0"); row += 1
+    cell(row, 1, "Improvements"); (tv.get("improvements") is not None) and cell(row, 2, tv["improvements"], fmt="#,##0"); row += 1
+    pr = row
+    cell(row, 1, "Pers Property"); (tv.get("pers_property") is not None) and cell(row, 2, tv["pers_property"], fmt="#,##0"); row += 1
+    ttv = row; cell(row, 1, "Total", True); cell(row, 2, f"=SUM({VL}{lr}:{VL}{pr})", True, "#,##0"); row = ttv + 3
+
+    cell(row, 1, "Property Tax - Per Formula")
+    cell(row, 2, f"=({VL}{trate}*{VL}{ttv})+{VL}{tda}", fmt="#,##0.00"); row += 1
+    cell(row, 1, "Property Tax - Hardcoded")
+    hc = data.get("property_tax_hardcoded")
+    if hc is not None:
+        cell(row, 2, hc, fmt="#,##0.00")
+
+    ws.column_dimensions[get_column_letter(LC)].width = 30
+    ws.column_dimensions[get_column_letter(VC)].width = 18
+    if screenshot_path and Path(screenshot_path).exists():
+        try:
+            img = XLImage(str(screenshot_path)); img.width = 460; img.height = 620
+            ws.add_image(img, f"{get_column_letter(4 + c0)}1")
+        except Exception:
+            pass
+    return row
+
+
+def build_combined_workbook(bills):
+    """bills: list of (data, apn, shot_path). Returns .xlsx bytes with one sheet per
+    bill (1, 2, …) plus a Combined sheet with all bills laid out side by side."""
+    from openpyxl import Workbook
+    wb = Workbook(); wb.remove(wb.active)
+    for i, (data, apn, shot) in enumerate(bills):
+        write_bill(wb.create_sheet(str(i + 1)), data, apn, c0=0, screenshot_path=shot)
+    combo = wb.create_sheet("Combined")
+    for i, (data, apn, shot) in enumerate(bills):
+        write_bill(combo, data, apn, c0=i * BILL_WIDTH, screenshot_path=None)
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  UI
 # ──────────────────────────────────────────────────────────────────────────
@@ -732,23 +819,23 @@ def render():
                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            key=f"dl_{key}", use_container_width=True)
 
-            # Batch actions
+            # Batch actions — ONE workbook: a sheet per bill + a side-by-side Combined sheet
             st.divider()
-            if st.button("💾 Save ALL to history & build zip", type="primary",
+            if st.button("📊 Save ALL & build combined workbook", type="primary",
                          use_container_width=True):
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "w") as zf:
-                    for key, (edited, shot, fname, save_name) in current.items():
-                        xb, xname = make_xlsx(edited, shot)
-                        shot_bytes = Path(shot).read_bytes() if shot and Path(shot).exists() else None
-                        save_record(save_name, edited["apn"], fname, edited, xb, shot_bytes)
-                        zf.writestr(xname, xb)
-                st.session_state["batch_zip"] = zip_buf.getvalue()
-                st.success(f"Saved {len(current)} bill(s) to history.")
+                bills = []
+                for key, (edited, shot, fname, save_name) in current.items():
+                    shot_bytes = Path(shot).read_bytes() if shot and Path(shot).exists() else None
+                    save_record(save_name, edited["apn"], fname, edited, make_xlsx(edited, shot)[0], shot_bytes)
+                    bills.append((edited, edited["apn"] or "unknown", shot))
+                st.session_state["batch_wb"] = build_combined_workbook(bills)
+                st.success(f"Built one workbook: {len(bills)} bill sheet(s) + a Combined sheet.")
 
-            if "batch_zip" in st.session_state:
-                st.download_button("⬇ Download all (zip)", data=st.session_state["batch_zip"],
-                                   file_name="tax_bills.zip", mime="application/zip",
+            if "batch_wb" in st.session_state:
+                st.download_button("⬇ Download combined workbook (.xlsx)",
+                                   data=st.session_state["batch_wb"],
+                                   file_name="tax_bills_combined.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    use_container_width=True)
 
 
