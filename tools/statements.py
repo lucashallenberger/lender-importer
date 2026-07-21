@@ -237,7 +237,14 @@ def build_workbook(summaries, detail, use_llm=True):
         det_T = det_M0 + nM
         col = det_T + 2                       # + spacer
     TOTAL = col; col += 2
-    RECON = col
+    RECON = col; col += 2
+    # compact year-over-year block on the far right: values only, one column per
+    # source, so big differences jump out without scanning the wide blocks
+    CMP = []                 # (compact col, source value col on this sheet, header)
+    for si, sm in enumerate(summaries):
+        CMP.append((col, sum_val_cols[si], sm['label'])); col += 1
+    if detail:
+        CMP.append((col, det_T, detail['label'])); col += 1
 
     # header
     comb.cell(1, CLS, 'Classification')
@@ -250,6 +257,8 @@ def build_workbook(summaries, detail, use_llm=True):
         comb.cell(1, det_T, 'YTD Total')
     comb.cell(1, TOTAL, 'Total (all)')
     comb.cell(1, RECON, 'Recon')
+    for cc, _srcc, hdr in CMP:
+        comb.cell(1, cc, hdr)
 
     for i, r in enumerate(spine):
         row = i + 2
@@ -300,6 +309,13 @@ def build_workbook(summaries, detail, use_llm=True):
         if not is_tot and detail:
             comb.cell(row, RECON,
                       f'=IF(ABS({get_column_letter(det_T)}{row}-SUM({get_column_letter(det_M0)}{row}:{get_column_letter(det_M0+nM-1)}{row}))<0.01,"ok","CHECK")')
+        # compact year-over-year mirror (same-sheet references, keeps red cues)
+        for k, (cc, srcc, _hdr) in enumerate(CMP):
+            if k < len(summaries):
+                redf = not (C(label) in smaps[k] or r.get('_only') == summaries[k]['label'])
+            else:
+                redf = not p26
+            put(comb, row, cc, f"={get_column_letter(srcc)}{row}", red=redf, bold=is_tot).number_format = CUR
 
     _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, detail is not None)
     for _, ws in stabs:
@@ -328,6 +344,7 @@ def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail
     if has_detail:
         spacers.add(det_T + 1)
     spacers.add(TOTAL + 1)
+    spacers.add(RECON + 1)
     for c in range(1, comb.max_column + 1):
         hc = comb.cell(1, c)
         if c in spacers:
