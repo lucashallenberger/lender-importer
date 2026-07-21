@@ -132,39 +132,76 @@ def classify(label):
 
 
 # ---------------------------------------------------------------- assemble
-def build_workbook(summaries, detail):
-    """summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None."""
+def _llm_refine(summaries, detail):
+    """Ask Claude to (a) align variant names onto the newest summary's labels and
+    (b) classify all line items. Returns (alias_map canon->canon, class_map
+    canon->class). Empty maps when no API key / any failure."""
+    try:
+        from tools import hist_llm
+        if not hist_llm.available():
+            return {}, {}
+        spine_labels = [r['label'] for r in (summaries[-1]['rows'] if summaries else [])
+                        if r.get('amount') is not None and not r.get('total') and not r.get('net')]
+        spine_keys = {canon(l) for l in spine_labels}
+        others = []
+        for sm in summaries[:-1]:
+            others += [r['label'] for r in sm['rows']
+                       if r.get('amount') is not None and not r.get('total') and not r.get('net')]
+        if detail:
+            others += list(detail['cats'].keys())
+        unmatched = sorted({l for l in others if canon(l) not in spine_keys})
+        amap = {}
+        for src, tgt in hist_llm.match_labels(unmatched, spine_labels).items():
+            if tgt:
+                amap[canon(src)] = canon(tgt)
+        all_items = sorted({*spine_labels, *others})
+        cmap = {canon(l): c for l, c in hist_llm.classify_labels(all_items).items()}
+        return amap, cmap
+    except Exception:
+        return {}, {}
+
+
+def build_workbook(summaries, detail, use_llm=True):
+    """summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
+    use_llm: when an ANTHROPIC_API_KEY is available, Claude aligns variant names
+    and classifies line items; otherwise the deterministic rules run alone."""
+    amap, cmap = _llm_refine(summaries, detail) if use_llm else ({}, {})
+
+    def C(s):
+        k = canon(s)
+        return amap.get(k, k)
+
     spine_src = summaries[-1]['rows'] if summaries else []
     spine = [dict(r) for r in spine_src]
-    spine_items = {canon(r['label']) for r in spine_src if r.get('amount') is not None and not r['total'] and not r.get('net')}
+    spine_items = {C(r['label']) for r in spine_src if r.get('amount') is not None and not r['total'] and not r.get('net')}
 
     extras = []
     seen = set(spine_items)
     for sm in summaries[:-1]:
         for r in sm['rows']:
-            if r.get('amount') is not None and not r['total'] and not r.get('net') and canon(r['label']) not in seen:
-                extras.append(dict(r, _only=sm['label'])); seen.add(canon(r['label']))
+            if r.get('amount') is not None and not r['total'] and not r.get('net') and C(r['label']) not in seen:
+                extras.append(dict(r, _only=sm['label'])); seen.add(C(r['label']))
     cats = detail['cats'] if detail else {}
     for name in cats:
-        if canon(name) not in seen:
-            extras.append({'label': name, 'amount': 0.0, '_only': detail['label']}); seen.add(canon(name))
+        if C(name) not in seen:
+            extras.append({'label': name, 'amount': 0.0, '_only': detail['label']}); seen.add(C(name))
     ins = next((i for i, r in enumerate(spine) if r.get('label', '').lower() == 'total expense'), len(spine))
     spine = spine[:ins] + extras + spine[ins:]
 
     months = detail['months'] if detail else []
     nM = len(months)
-    cats_c = {canon(k): k for k in cats}
-    tot_c = {canon(k): k for k in (detail['totals'] if detail else {})}
+    cats_c = {C(k): k for k in cats}
+    tot_c = {C(k): k for k in (detail['totals'] if detail else {})}
 
     def ytd_item(label):
-        k = canon(label)
+        k = C(label)
         if k in cats_c:
             return cats_c[k]
         m = difflib.get_close_matches(k, list(cats_c), n=1, cutoff=0.86)
         return cats_c[m[0]] if m else None
 
     def ytd_total(label):
-        name = re.sub(r'^total\s+', '', canon(label))
+        name = re.sub(r'^total\s+', '', C(label))
         if name in tot_c:
             return tot_c[name]
         m = difflib.get_close_matches(name, list(tot_c), n=1, cutoff=0.86)
@@ -180,7 +217,7 @@ def build_workbook(summaries, detail):
         dtab = wb.create_sheet(detail['label'][:31]); dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
 
     # per-summary lookups (canon -> (orig label, amount))
-    smaps = [{canon(r['label']): (r['label'], r['amount']) for r in sm['rows'] if r.get('amount') is not None} for sm in summaries]
+    smaps = [{C(r['label']): (r['label'], r['amount']) for r in sm['rows'] if r.get('amount') is not None} for sm in summaries]
 
     def put(ws, row, col, val, red=False, bold=False):
         c = ws.cell(row, col, val)
@@ -221,7 +258,7 @@ def build_workbook(summaries, detail):
 
         # write source tabs
         for si, (sm, ws) in enumerate(stabs):
-            m = smaps[si].get(canon(label))
+            m = smaps[si].get(C(label))
             ws.cell(row, 1, m[0] if m else label)
             ws.cell(row, 2, m[1] if m else 0)
         cm = None if is_sec else (ytd_item(label) if detail else None)
@@ -242,11 +279,11 @@ def build_workbook(summaries, detail):
                 put(comb, row, det_L, label, bold=True)
             continue
         if not is_tot:
-            comb.cell(row, CLS, classify(label))
+            comb.cell(row, CLS, cmap.get(canon(label)) or classify(label))
 
         # summary blocks
         for si, Lc, Vc in sum_blocks:
-            present = canon(label) in smaps[si] or r.get('_only') == summaries[si]['label']
+            present = C(label) in smaps[si] or r.get('_only') == summaries[si]['label']
             put(comb, row, Lc, f"='{summaries[si]['label'][:31]}'!A{row}", red=not present, bold=is_tot)
             put(comb, row, Vc, f"='{summaries[si]['label'][:31]}'!B{row}", red=not present, bold=is_tot).number_format = CUR
         # detail block

@@ -6,6 +6,7 @@ import re
 import streamlit as st
 
 from tools import statements as S
+from tools import hist_llm
 
 
 def _guess_label(name):
@@ -21,6 +22,14 @@ def render():
     st.caption("Upload income statements (summary or transaction-detail PDFs). You get one tab per "
                "statement plus a combined tab: categories aligned across years, every number a live "
                "formula back to its source, and any year missing a line shown in red.")
+
+    ai_on = hist_llm.available()
+    if ai_on:
+        st.caption("🤖 AI assist: **on** — Claude aligns variant category names, classifies line "
+                   "items, and reads statements the built-in parser can't.")
+    else:
+        st.caption("AI assist: off (set ANTHROPIC_API_KEY in the app secrets to enable smarter "
+                   "matching, classification, and extraction of unfamiliar statement formats).")
 
     files = st.file_uploader("Statements (PDF)", type=["pdf"], accept_multiple_files=True)
     if not files:
@@ -43,18 +52,35 @@ def render():
         return
 
     summaries, detail = [], None
-    with st.spinner("Parsing statements & assembling…"):
+    ai_extracted = []
+    with st.spinner("Parsing statements & assembling…" + (" (AI assist on)" if ai_on else "")):
         for label, kind, data in items:
             try:
                 if kind == "summary":
-                    summaries.append({"label": label, "rows": S.parse_summary(data)})
+                    rows = S.parse_summary(data)
+                    # weak parse (unfamiliar format)? -> let Claude read the PDF
+                    n_items = sum(1 for r in rows if r.get("amount") is not None
+                                  and not r.get("total") and not r.get("net"))
+                    if n_items < 3 and ai_on:
+                        rows = hist_llm.extract_statement(data)
+                        ai_extracted.append(label)
+                    summaries.append({"label": label, "rows": rows})
                 else:
-                    detail = {"label": label, **S.parse_detail(data)}
+                    d = S.parse_detail(data)
+                    if not d["cats"] and ai_on:   # detail parser found nothing
+                        rows = hist_llm.extract_statement(data)
+                        ai_extracted.append(label)
+                        summaries.append({"label": label, "rows": rows})
+                    else:
+                        detail = {"label": label, **d}
             except Exception as e:  # noqa: BLE001
                 st.error(f"Could not parse '{label}': {e}")
                 return
         summaries.sort(key=lambda s: s["label"])
         xlsx = S.build_workbook(summaries, detail)
+    if ai_extracted:
+        st.info("Read by AI (built-in parser couldn't handle the format): " + ", ".join(ai_extracted)
+                + ". Double-check these against the source PDFs.")
 
     st.success(f"Built — {len(summaries)} summary statement(s)"
                + (f" + 1 detail ({len(detail['months'])} months)" if detail else "") + ".")
