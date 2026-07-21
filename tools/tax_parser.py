@@ -695,16 +695,142 @@ def write_bill(ws, data, apn, c0=0, screenshot_path=None):
     return row
 
 
+def _apn_fmt(apn):
+    raw = re.sub(r"[^0-9]", "", apn or "")[:10]
+    return f"{raw[:4]}-{raw[4:7]}-{raw[7:10]}" if len(raw) >= 10 else (raw or "APN?")
+
+
+def _union(names_per_bill):
+    """Union of names across bills, preserving first-seen order. Returns
+    (ordered display names, per-bill lookup dicts keyed by normalized name)."""
+    def norm(n):
+        return re.sub(r'\s+', ' ', str(n).strip().upper())
+    order, seen = [], set()
+    lookups = []
+    for pairs in names_per_bill:
+        lut = {}
+        for name, val in pairs:
+            k = norm(name)
+            lut[k] = val
+            if k not in seen:
+                seen.add(k); order.append((k, name))
+        lookups.append(lut)
+    return order, lookups
+
+
+def _write_combined(ws, bills):
+    """Aligned grid: shared labels in col A, one value column per bill, and a
+    COMBINED column that SUMS across the bills with live formulas."""
+    from openpyxl.styles import Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    bold = Font(bold=True, name="Arial"); boldw = Font(bold=True, name="Arial", color="FFFFFF")
+    normal = Font(name="Arial"); dark = PatternFill("solid", fgColor="404040")
+    n = len(bills)
+    bcols = list(range(2, 2 + n))          # one value column per bill
+    ccol = 2 + n                           # COMBINED column
+    B0, BL = get_column_letter(bcols[0]), get_column_letter(bcols[-1])
+    CL = get_column_letter(ccol)
+
+    def header(row, title, with_apns=True):
+        ws.cell(row, 1, title).font = boldw
+        for c in range(1, ccol + 1):
+            ws.cell(row, c).fill = dark
+        if with_apns:
+            for i, col in enumerate(bcols):
+                ws.cell(row, col, _apn_fmt(bills[i][1])).font = boldw
+        ws.cell(row, ccol, "COMBINED").font = boldw
+
+    def sum_row(row, fmt):
+        c = ws.cell(row, ccol, f"=SUM({B0}{row}:{BL}{row})")
+        c.font = normal; c.number_format = fmt
+        return c
+
+    row = 1
+    # ── MILL RATE ─────────────────────────────────────────────────────────
+    header(row, "MILL RATE"); row += 1
+    rate_lists = [[(a, r) for a, r in (d["mill_rates"] or [])] for d, _, _ in bills]
+    order, luts = _union(rate_lists)
+    rs = row
+    for k, name in order:
+        ws.cell(row, 1, name).font = normal
+        present = [lut[k] for lut in luts if k in lut]
+        for i, col in enumerate(bcols):
+            if k in luts[i]:
+                c = ws.cell(row, col, luts[i][k] / 100); c.number_format = '0.00000000%'; c.font = normal
+        # rates don't add — show in COMBINED only when every bill agrees
+        if len(present) == n and len({round(p, 10) for p in present}) == 1:
+            c = ws.cell(row, ccol, present[0] / 100); c.number_format = '0.00000000%'; c.font = normal
+        row += 1
+    re_ = row - 1
+    ws.cell(row, 1, "Total").font = bold
+    for col in bcols + [ccol]:
+        L = get_column_letter(col)
+        c = ws.cell(row, col, f"=SUM({L}{rs}:{L}{re_})"); c.font = bold; c.number_format = '0.00000000%'
+    trate = row; row += 3
+
+    # ── DIRECT ASSESSMENTS (summed) ──────────────────────────────────────
+    header(row, "DIRECT ASSESSMENTS"); row += 1
+    da_lists = [[(nm, amt) for nm, amt in (d["direct_assessments"] or [])] for d, _, _ in bills]
+    order, luts = _union(da_lists)
+    ds = row
+    for k, name in order:
+        ws.cell(row, 1, name).font = normal
+        for i, col in enumerate(bcols):
+            if k in luts[i]:
+                c = ws.cell(row, col, luts[i][k]); c.number_format = '#,##0.00'; c.font = normal
+        sum_row(row, '#,##0.00')
+        row += 1
+    de = row - 1
+    ws.cell(row, 1, "Total").font = bold
+    for col in bcols + [ccol]:
+        L = get_column_letter(col)
+        c = ws.cell(row, col, f"=SUM({L}{ds}:{L}{de})"); c.font = bold; c.number_format = '#,##0.00'
+    tda = row; row += 3
+
+    # ── TAXABLE VALUE (summed) ───────────────────────────────────────────
+    header(row, "TAXABLE VALUE"); row += 1
+    tv_rows = []
+    for label, key in (("Land", "land"), ("Improvements", "improvements"), ("Pers Property", "pers_property")):
+        ws.cell(row, 1, label).font = normal
+        for i, col in enumerate(bcols):
+            v = bills[i][0]["taxable_value"].get(key)
+            if v is not None:
+                c = ws.cell(row, col, v); c.number_format = '#,##0'; c.font = normal
+        sum_row(row, '#,##0')
+        tv_rows.append(row); row += 1
+    ws.cell(row, 1, "Total").font = bold
+    for col in bcols + [ccol]:
+        L = get_column_letter(col)
+        c = ws.cell(row, col, f"=SUM({L}{tv_rows[0]}:{L}{tv_rows[-1]})"); c.font = bold; c.number_format = '#,##0'
+    ttv = row; row += 3
+
+    # ── PROPERTY TAX (summed) ────────────────────────────────────────────
+    ws.cell(row, 1, "Property Tax - Per Formula").font = normal
+    for col in bcols:
+        L = get_column_letter(col)
+        c = ws.cell(row, col, f"=({L}{trate}*{L}{ttv})+{L}{tda}"); c.number_format = '#,##0.00'; c.font = normal
+    sum_row(row, '#,##0.00'); row += 1
+    ws.cell(row, 1, "Property Tax - Hardcoded").font = normal
+    for i, col in enumerate(bcols):
+        hc = bills[i][0].get("property_tax_hardcoded")
+        if hc is not None:
+            c = ws.cell(row, col, hc); c.number_format = '#,##0.00'; c.font = normal
+    sum_row(row, '#,##0.00')
+
+    ws.column_dimensions['A'].width = 30
+    for col in bcols + [ccol]:
+        ws.column_dimensions[get_column_letter(col)].width = 15
+
+
 def build_combined_workbook(bills):
     """bills: list of (data, apn, shot_path). Returns .xlsx bytes with one sheet per
-    bill (1, 2, …) plus a Combined sheet with all bills laid out side by side."""
+    bill (1, 2, …) plus a Combined sheet: bills in aligned columns and a COMBINED
+    column that adds them up (live SUM formulas)."""
     from openpyxl import Workbook
     wb = Workbook(); wb.remove(wb.active)
     for i, (data, apn, shot) in enumerate(bills):
         write_bill(wb.create_sheet(str(i + 1)), data, apn, c0=0, screenshot_path=shot)
-    combo = wb.create_sheet("Combined")
-    for i, (data, apn, shot) in enumerate(bills):
-        write_bill(combo, data, apn, c0=i * BILL_WIDTH, screenshot_path=None)
+    _write_combined(wb.create_sheet("Combined"), bills)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
