@@ -187,9 +187,12 @@ def match_labels(sources, targets):
             messages=[{"role": "user", "content": prompt}],
             output_config={"format": {"type": "json_schema", "schema": schema}},
         )
-        tset = set(targets)
+        tset, sset = set(targets), set(todo)
         for m in _json_response(resp)["matches"]:
-            s = m["source"]; t = m["target"] if m["target"] in tset else None
+            s = m["source"]
+            if s not in sset:            # model must echo inputs exactly — drop junk
+                continue
+            t = m["target"] if m["target"] in tset else None
             out[s] = t
             cache["aliases"][f"{s}::{tkey}"] = t or ""
         _save_cache(cache)
@@ -225,22 +228,34 @@ def classify_labels(labels):
             }},
             "required": ["items"], "additionalProperties": False,
         }
-        prompt = (
-            "Classify each property operating-statement line item into exactly one "
-            "underwriting bucket.\n\nBuckets:\n" + "\n".join(f"- {c}" for c in CLASSES) +
-            f"\n\nLine items:\n{json.dumps(todo, indent=1)}\n\n"
-            "Notes: utilities (power/water/sewer/gas/trash/internet) -> 'OpEx - Utilities'. "
-            "Routine repairs, maintenance, cleaning, pest, gardening, supplies -> 'OpEx - R&M'. "
-            "Mortgage/debt service -> 'Non-OpEx - Mortgage Interest'. Deposits, escrow, "
-            "prepayments, one-time non-operating flows -> 'Non-OpEx - Other'."
-        )
-        resp = _client().messages.create(
-            model=MODEL, max_tokens=8000, thinking={"type": "adaptive"},
-            messages=[{"role": "user", "content": prompt}],
-            output_config={"format": {"type": "json_schema", "schema": schema}},
-        )
-        for m in _json_response(resp)["items"]:
-            out[m["label"]] = m["classification"]
-            cache["classes"][m["label"]] = m["classification"]
+
+        def ask(labels):
+            prompt = (
+                "Classify each property operating-statement line item into exactly one "
+                "underwriting bucket. Echo every label EXACTLY as given, one entry per "
+                "label, no additions.\n\nBuckets:\n" + "\n".join(f"- {c}" for c in CLASSES) +
+                f"\n\nLine items:\n{json.dumps(labels, indent=1)}\n\n"
+                "Notes: utilities (power/water/sewer/gas/trash/internet) -> 'OpEx - Utilities'. "
+                "Routine repairs, maintenance, cleaning, pest, gardening, supplies -> 'OpEx - R&M'. "
+                "Mortgage/debt service -> 'Non-OpEx - Mortgage Interest'. Deposits, escrow, "
+                "prepayments, one-time non-operating flows -> 'Non-OpEx - Other'."
+            )
+            resp = _client().messages.create(
+                model=MODEL, max_tokens=8000, thinking={"type": "adaptive"},
+                messages=[{"role": "user", "content": prompt}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
+            return _json_response(resp)["items"]
+
+        pending = list(todo)
+        for _attempt in range(2):            # one retry for anything dropped/mangled
+            pset = set(pending)
+            for m in ask(pending):
+                if m["label"] in pset:       # accept only exact echoes of inputs
+                    out[m["label"]] = m["classification"]
+                    cache["classes"][m["label"]] = m["classification"]
+            pending = [l for l in pending if l not in out]
+            if not pending:
+                break
         _save_cache(cache)
     return out
