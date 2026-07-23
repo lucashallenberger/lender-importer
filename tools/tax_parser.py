@@ -1001,7 +1001,7 @@ def _write_combined(ws, bills):
                 pass
 
 
-def build_tax_into(wb, bills, prefix="", combined_name="Combined"):
+def build_tax_into(wb, bills, prefix="S - Tax ", combined_name="W - RE Taxes"):
     """Write per-bill sheets (year-named, oldest→newest) + a combined sheet into an
     existing workbook. Returns metadata for the NEWEST year-bearing bill so other
     sheets can link its annual tax: {'sheet', 'hardcoded_cell', 'performula_cell'}."""
@@ -1029,8 +1029,9 @@ def build_combined_workbook(bills):
     from openpyxl import Workbook
     wb = Workbook(); wb.remove(wb.active)
     build_tax_into(wb, bills)
-    if len(bills) == 1:                 # standalone tool always shows Combined
-        _write_combined(wb["Combined"] if "Combined" in wb.sheetnames else wb.create_sheet("Combined"),
+    if len(bills) == 1:                 # standalone tool always shows the combined tab
+        _write_combined(wb["W - RE Taxes"] if "W - RE Taxes" in wb.sheetnames
+                        else wb.create_sheet("W - RE Taxes"),
                         sorted(bills, key=lambda b: (b[3] is None, b[3] or 0)))
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 

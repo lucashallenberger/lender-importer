@@ -237,6 +237,16 @@ def _build_source(ws, data):
 
     headers = ["Unit", "Type", "Monthly Rent", "Status", "Lease Name",
                "Lease Status", "Move-In Date"]
+    # keep everything the PDF showed: append optional columns AFTER the fixed
+    # seven so the Worksheet's A–G links never move
+    has_sf = any(u.get("unit_sf") for u in units)
+    has_end = any((u.get("lease_end") or "").strip() for u in units)
+    has_term = any((u.get("lease_type") or "").strip() for u in units)
+    extras = ([("SF", "unit_sf")] if has_sf else []) \
+           + ([("Lease End", "lease_end")] if has_end else []) \
+           + ([("Lease Term", "lease_type")] if has_term else [])
+    headers += [h for h, _ in extras]
+    ncol = len(headers)
     hrow = 5
     for c, h in enumerate(headers, start=1):
         cell = ws.cell(hrow, c, h)
@@ -254,8 +264,13 @@ def _build_source(ws, data):
         ws.cell(r, 5, "" if vac else u.get("lease_name", ""))
         ws.cell(r, 6, "" if vac else u.get("lease_status", ""))
         ws.cell(r, 7, u.get("move_in_date", ""))
+        for j, (_, k) in enumerate(extras):
+            v = u.get(k)
+            cell = ws.cell(r, 8 + j, float(v) if k == "unit_sf" and v else (v or ""))
+            if k == "unit_sf" and v:
+                cell.number_format = "#,##0"
         if vac:
-            for c in range(1, 8):
+            for c in range(1, ncol + 1):
                 ws.cell(r, c).fill = peach
                 ws.cell(r, c).font = Font(italic=True, color="C00000")
     de = ds + n - 1
@@ -265,7 +280,9 @@ def _build_source(ws, data):
     ws.cell(tr, 1, "TOTAL").font = bold
     ws.cell(tr, 2, f"{n} units").font = bold
     tc = ws.cell(tr, 3, f"=SUM(C{ds}:C{de})"); tc.font = bold; tc.number_format = MONEY
-    for c in range(1, 8):
+    if has_sf:
+        sc = ws.cell(tr, 8, f"=SUM(H{ds}:H{de})"); sc.font = bold; sc.number_format = "#,##0"
+    for c in range(1, ncol + 1):
         ws.cell(tr, c).fill = blue
 
     # Rent Summary block (live formulas)
@@ -291,7 +308,7 @@ def _build_source(ws, data):
             ws.cell(rr, c).fill = green
     ws.cell(sr, 1).fill = green
 
-    widths = [8, 12, 16, 12, 22, 14, 14]
+    widths = [8, 12, 16, 12, 22, 14, 14] + [10] * len(extras)
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
@@ -420,7 +437,7 @@ def _build_worksheet(ws, data, refs):
     ws.freeze_panes = "A4"
 
 
-def build_into(wb, data: dict, name="Worksheet", src_name="Source", prop_info=None) -> dict:
+def build_into(wb, data: dict, name="W - RR", src_name="S - RR", prop_info=None) -> dict:
     """Write the Worksheet + Source pair (and an optional Property Info cover
     sheet) into an existing workbook. Returns the Source refs for linking."""
     if prop_info:

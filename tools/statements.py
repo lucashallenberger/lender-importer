@@ -184,7 +184,8 @@ def _llm_refine(summaries, detail):
         return {}, {}, set()
 
 
-def build_into(wb, summaries, detail, use_llm=True, combined_title='Combined'):
+def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historicals',
+               src_prefix='S - '):
     """Write the combined + source sheets into an existing workbook. Returns
     metadata for cross-sheet linking (classification SUMIFs on the combined tab).
     summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
@@ -263,14 +264,16 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='Combined'):
              for sm in summaries]
 
     comb = wb.create_sheet(combined_title)
+    stab_names = [(src_prefix + sm['label'])[:31] for sm in summaries]
+    dtab_name = (src_prefix + detail['label'])[:31] if detail else None
     stabs = []
     for si, sm in enumerate(summaries):
-        ws = wb.create_sheet(sm['label'][:31])
+        ws = wb.create_sheet(stab_names[si])
         ws.append(['Line', sm['label']] + [f'Col {j}' for j in range(2, ncols[si] + 1)])
         stabs.append((sm, ws))
     dtab = None
     if detail:
-        dtab = wb.create_sheet(detail['label'][:31]); dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
+        dtab = wb.create_sheet(dtab_name); dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
 
     def put(ws, row, col, val, red=False, bold=False):
         c = ws.cell(row, col, val)
@@ -360,12 +363,12 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='Combined'):
         # summary blocks
         for si, Lc, Vc in sum_blocks:
             present = C(label) in smaps[si] or r.get('_only') == summaries[si]['label']
-            put(comb, row, Lc, f"='{summaries[si]['label'][:31]}'!A{row}", red=not present, bold=is_tot)
-            put(comb, row, Vc, f"='{summaries[si]['label'][:31]}'!B{row}", red=not present, bold=is_tot).number_format = CUR
+            put(comb, row, Lc, f"='{stab_names[si]}'!A{row}", red=not present, bold=is_tot)
+            put(comb, row, Vc, f"='{stab_names[si]}'!B{row}", red=not present, bold=is_tot).number_format = CUR
         # detail block
         if detail:
             p26 = bool(cm) or bool(tm) or r.get('_only') == detail['label']
-            dl = detail['label'][:31]
+            dl = dtab_name
             put(comb, row, det_L, f"='{dl}'!A{row}", red=not p26, bold=is_tot)
             for j in range(nM):
                 put(comb, row, det_M0 + j, f"='{dl}'!{get_column_letter(2 + j)}{row}", red=not p26, bold=is_tot).number_format = CUR

@@ -118,11 +118,11 @@ def build_underwriting(prop_info, rr_data, tax_bills, summaries, detail, use_llm
     if prop_info and any(v is not None for v in prop_info.values()):
         PI.build_sheet(wb.create_sheet("Property Info"), prop_info)
     if rr_data:
-        RR.build_into(wb, rr_data, name="Rent Roll", src_name="Rent Roll Source")
+        RR.build_into(wb, rr_data, name="W - RR", src_name="S - RR")
     if summaries or detail:
-        ST.build_into(wb, summaries, detail, use_llm=use_llm, combined_title="Historicals")
+        ST.build_into(wb, summaries, detail, use_llm=use_llm, combined_title="W - Historicals")
     if tax_bills:
-        TX.build_tax_into(wb, tax_bills, prefix="Tax ", combined_name="RE Taxes")
+        TX.build_tax_into(wb, tax_bills, prefix="S - Tax ", combined_name="W - RE Taxes")
     if not wb.sheetnames:
         raise RuntimeError("nothing to build — no parsable documents")
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
