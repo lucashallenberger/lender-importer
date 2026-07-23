@@ -16,7 +16,7 @@ st.set_page_config(page_title="QCP Tools", page_icon="🏢", layout="wide")
 from tools import tax_parser, lender_importer, historicals, rent_roll, underwrite  # noqa: E402
 
 PAGES = {
-    "Underwriting (Beta)": underwrite.render,
+    "Underwriter": underwrite.render,
     "Tax Bill Parser": tax_parser.render,
     "Rent Roll Parser": rent_roll.render,
     "Lender Importer": lender_importer.render,
