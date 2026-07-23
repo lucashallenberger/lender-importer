@@ -9,10 +9,13 @@ Core parsing and Excel-building logic is unchanged from the CLI version.
 
 import re
 import io
+import base64
 import tempfile
 from pathlib import Path
 
 import streamlit as st
+
+from tools import hist_llm   # shared Claude plumbing (api_key/_client/MODEL/_json_response)
 
 # All intermediate files (screenshot, xlsx) go to a per-session temp folder.
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "apn_tax_tool"
@@ -323,6 +326,130 @@ def pdf_to_screenshot(pdf_path: Path) -> Path:
 
     print(f"[WARN] Could not render PDF screenshot - no image will be embedded")
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  OPTIONAL CLAUDE EXTRACTION  (reliability layer — mirrors the Historicals/
+#  Rent Roll tools; activates only when ANTHROPIC_API_KEY is present)
+# ──────────────────────────────────────────────────────────────────────────
+
+_TAX_PROMPT = """This is an LA County (California) SECURED PROPERTY TAX BILL.
+Transcribe faithfully — do not compute or invent anything.
+
+Extract:
+- apn: the Assessor's Parcel Number (e.g. "5208-020-009"), or null
+- tax_year: the fiscal year START as a 4-digit year (for "FISCAL YEAR JULY 1,
+  2024" or "2024-25" return 2024), or null
+- mill_rates: every taxing agency in the general tax levy / voted-indebtedness
+  rate table, each with its RATE exactly as printed (a small number such as
+  1.000000 or 0.012232). Include an "All Agencies" line if one is shown.
+- direct_assessments: every direct-assessment line with its dollar amount
+- taxable_value: the assessed land, improvements, and personal-property values
+  as integers (null for any not shown)
+- property_tax_total: the total ANNUAL tax for the year (the combined total of
+  both installments), or null
+
+Use the exact printed labels. Do not merge or skip lines."""
+
+_TAX_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "apn": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "tax_year": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "mill_rates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"agency": {"type": "string"}, "rate": {"type": "number"}},
+                "required": ["agency", "rate"], "additionalProperties": False,
+            },
+        },
+        "direct_assessments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "amount": {"type": "number"}},
+                "required": ["name", "amount"], "additionalProperties": False,
+            },
+        },
+        "taxable_value": {
+            "type": "object",
+            "properties": {
+                "land": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "improvements": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                "pers_property": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+            },
+            "required": ["land", "improvements", "pers_property"], "additionalProperties": False,
+        },
+        "property_tax_total": {"anyOf": [{"type": "number"}, {"type": "null"}]},
+    },
+    "required": ["apn", "tax_year", "mill_rates", "direct_assessments",
+                 "taxable_value", "property_tax_total"],
+    "additionalProperties": False,
+}
+
+
+def ai_available() -> bool:
+    return hist_llm.available()
+
+
+def extract_tax_bill(pdf_bytes: bytes) -> dict:
+    """Claude reads the bill PDF and returns the same dict shape as parse_pdf."""
+    resp = hist_llm._client().messages.create(
+        model=hist_llm.MODEL,
+        max_tokens=16000,
+        thinking={"type": "adaptive"},
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf",
+                            "data": base64.standard_b64encode(pdf_bytes).decode()}},
+                {"type": "text", "text": _TAX_PROMPT},
+            ],
+        }],
+        output_config={"format": {"type": "json_schema", "schema": _TAX_SCHEMA}},
+    )
+    j = hist_llm._json_response(resp)
+    tv = j.get("taxable_value") or {}
+    return {
+        "apn": j.get("apn"),
+        "tax_year": j.get("tax_year"),
+        "mill_rates": [(m["agency"], float(m["rate"])) for m in (j.get("mill_rates") or [])],
+        "direct_assessments": [(d["name"], float(d["amount"])) for d in (j.get("direct_assessments") or [])],
+        "taxable_value": {"land": tv.get("land"), "improvements": tv.get("improvements"),
+                          "pers_property": tv.get("pers_property")},
+        "property_tax_hardcoded": j.get("property_tax_total"),
+    }
+
+
+def _weak_tax(data: dict) -> bool:
+    """True when the regex parse looks thin — trigger the Claude fallback."""
+    tv = data.get("taxable_value") or {}
+    return (len(data.get("mill_rates") or []) < 2
+            or not data.get("direct_assessments")
+            or tv.get("land") is None
+            or data.get("property_tax_hardcoded") is None)
+
+
+def _merge_tax(base: dict, ai: dict) -> dict:
+    """Fill gaps in the regex parse with Claude's read; prefer the longer list."""
+    out = dict(base)
+    for k in ("apn", "tax_year", "property_tax_hardcoded"):
+        if not out.get(k) and ai.get(k) is not None:
+            out[k] = ai[k]
+    if len(ai.get("mill_rates") or []) > len(out.get("mill_rates") or []):
+        out["mill_rates"] = ai["mill_rates"]
+    if len(ai.get("direct_assessments") or []) > len(out.get("direct_assessments") or []):
+        out["direct_assessments"] = ai["direct_assessments"]
+    tv = dict(out.get("taxable_value") or {})
+    for k, v in (ai.get("taxable_value") or {}).items():
+        if tv.get(k) is None and v is not None:
+            tv[k] = v
+    out["taxable_value"] = tv
+    return out
+
+
 def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
     """
     Creates the Excel file matching the Example.xlsx layout.
@@ -919,21 +1046,43 @@ def render():
         files = st.file_uploader("Tax bill PDFs", type=["pdf"],
                                  accept_multiple_files=True, label_visibility="collapsed")
 
+        ai_on = ai_available()
+        if ai_on:
+            always_ai = st.checkbox(
+                "🤖 Double-check every bill with AI — Claude reads the PDF directly "
+                "(slower + a small cost per bill, but you won't need to hand-verify).",
+                value=False)
+            st.caption("AI assist: **on** — any bill the built-in parser reads weakly is "
+                       "automatically re-read by Claude.")
+        else:
+            always_ai = False
+            st.caption("AI assist: off (set ANTHROPIC_API_KEY in the app secrets to enable it).")
+
         parsed = st.session_state.setdefault("parsed", {})
 
         # Parse any newly added files
         if files:
             seen = set()
             for f in files:
-                key = f"{f.name}:{f.size}"
+                key = f"{f.name}:{f.size}:{int(always_ai)}"
                 seen.add(key)
                 if key not in parsed:
                     pdf_path = OUTPUT_DIR / f.name
-                    pdf_path.write_bytes(f.getbuffer())
+                    pdf_bytes = bytes(f.getbuffer())
+                    pdf_path.write_bytes(pdf_bytes)
                     with st.spinner(f"Reading {f.name}…"):
                         data = parse_pdf(pdf_path)
+                        used_ai = False
+                        if ai_on and (always_ai or _weak_tax(data)):
+                            try:
+                                data = _merge_tax(data, extract_tax_bill(pdf_bytes))
+                                used_ai = True
+                            except Exception as e:  # noqa: BLE001
+                                st.warning(f"AI read failed for {f.name}: {e}")
                         shot = pdf_to_screenshot(pdf_path)
-                    if data.get("scanned_no_text"):
+                    if used_ai:
+                        st.info(f"🤖 {f.name}: read/verified by Claude — spot-check the values against the preview.")
+                    elif data.get("scanned_no_text"):
                         st.warning(
                             f"“{f.name}” looks scanned (no text layer) and OCR isn't available, "
                             "so fields may be blank. Install tesseract for OCR, or upload a text-based PDF.")

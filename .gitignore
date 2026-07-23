@@ -11,6 +11,8 @@ dist/
 .DS_Store
 
 # merge/streamlit extras
+.streamlit/secrets.toml
+.env
 _tax_tool/
 dist_win/
 tools/data/
