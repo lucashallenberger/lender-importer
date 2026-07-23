@@ -30,8 +30,8 @@ MONEY0     = '"$"#,##0'
 MONEY_DASH = '"$"#,##0.00;-"$"#,##0.00;"-"'   # zero shows as "-"
 PCT        = '0.0%'
 
-UNIT_COLS = ["Unit", "Unit Type", "Monthly Rent", "Status", "Lease Name",
-             "Lease Status", "Move-In Date", "Lease End", "Lease Type", "Notes"]
+UNIT_COLS = ["Unit", "Unit Type", "SF", "Monthly Rent", "Status", "Lease Name",
+             "Lease Status", "Move-In Date", "Lease End", "Lease Term", "Notes"]
 
 
 # ── extraction ──────────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ Header:
 For each unit:
 - unit: unit number/label exactly as printed (e.g. "01")
 - unit_type: floor-plan/type exactly as printed (e.g. "1/1/d", "Single")
+- unit_sf: the unit's square footage as a number, or null if not shown
 - monthly_rent: the unit's monthly rent as a number. For a VACANT unit use the
   target/asking/market rent shown for it (or 0 if none is shown).
 - status: "Occupied" or "Vacant"
@@ -57,7 +58,8 @@ For each unit:
 - lease_status: e.g. "Active", or ""
 - move_in_date: move-in / lease start date as printed (e.g. "10/01/2013"), or ""
 - lease_end: lease end as printed — a date or "MTM", or ""
-- lease_type: e.g. "MTM", "Fixed", or ""
+- lease_type: the lease term exactly as printed (e.g. "MTM", "1 year",
+  "MTM since 4/25", "Airbnb 2 months begin 6/15/26"), or ""
 
 Use the primary rent column if several are shown. Keep the units in printed order."""
 
@@ -75,6 +77,7 @@ _SCHEMA = {
                 "properties": {
                     "unit": {"type": "string"},
                     "unit_type": {"type": "string"},
+                    "unit_sf": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                     "monthly_rent": {"anyOf": [{"type": "number"}, {"type": "null"}]},
                     "status": {"type": "string"},
                     "lease_name": {"type": "string"},
@@ -83,7 +86,7 @@ _SCHEMA = {
                     "lease_end": {"type": "string"},
                     "lease_type": {"type": "string"},
                 },
-                "required": ["unit", "unit_type", "monthly_rent", "status",
+                "required": ["unit", "unit_type", "unit_sf", "monthly_rent", "status",
                              "lease_name", "lease_status", "move_in_date",
                              "lease_end", "lease_type"],
                 "additionalProperties": False,
@@ -306,103 +309,123 @@ def _build_source(ws, data):
 
 
 # ── workbook: Worksheet sheet (underwriting format, sourced) ────────────────
+# Columns: A UNIT#  B TENANT NAME  C UNIT TYPE  D SIZE(SF)  E SIZE(%)
+#          F IN-PLACE $/SF  G IN-PLACE $  H MARKET $/SF  I MARKET $
+#          J LEASE TERM  K LEASE START  L LEASE END  M IN-PLACE VACANCY
+#          N LOSS TO LEASE  O NOTES
 def _build_worksheet(ws, data, refs):
-    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
     hdr_font = Font(bold=True, color="FFFFFF")
-    navy = PatternFill("solid", fgColor=NAVY)
+    grey = PatternFill("solid", fgColor="808080")
     green = PatternFill("solid", fgColor=GREEN)
-    peach = PatternFill("solid", fgColor=PEACH)
     bold = Font(bold=True)
+    redi = Font(italic=True, color="C00000")
     note = Font(italic=True, size=9, color="808080")
+    hairline = Border(bottom=Side(style="hair", color="404040"))
+    center = Alignment(horizontal="center", vertical="center")
 
-    headers = ["UNIT", "TENANT", "UNIT TYPE", "IN-PLACE RENT ($)",
-               "MARKET RENT ($)", "LEASE TYPE", "LEASE START", "LEASE END",
-               "IN-PLACE VACANCY", "LOSS TO LEASE", "ANNUAL IN-PLACE RENT", "NOTES"]
-    for c, h in enumerate(headers, start=1):
-        cell = ws.cell(1, c, h)
-        cell.font = hdr_font; cell.fill = navy
-        cell.alignment = Alignment(horizontal="center", wrap_text=True, vertical="center")
+    # ── 3-row grouped header ─────────────────────────────────────────────
+    top = {1: "UNIT", 2: "TENANT", 3: "UNIT", 4: "UNIT SIZE", 6: "IN PLACE RENT",
+           8: "MARKET RENT", 10: "LEASE", 11: "LEASE", 12: "LEASE",
+           13: "IN PLACE", 14: "LOSS", 15: "NOTES"}
+    mid = {1: "#", 2: "NAME", 3: "TYPE", 10: "TERM", 11: "START", 12: "END",
+           13: "VACANCY", 14: "TO LEASE"}
+    sub = {4: "(SF)", 5: "(%)", 6: "($/SF)", 7: "($)", 8: "($/SF)", 9: "($)"}
+    for c, v in top.items():
+        ws.cell(1, c, v)
+    for c, v in mid.items():
+        ws.cell(2, c, v)
+    for c, v in sub.items():
+        ws.cell(3, c, v)
+    for a, b in ((4, 5), (6, 7), (8, 9)):     # group labels span their two columns
+        ws.merge_cells(start_row=1, start_column=a, end_row=1, end_column=b)
+    for r in (1, 2, 3):
+        for c in range(1, 16):
+            cell = ws.cell(r, c)
+            cell.font = hdr_font; cell.fill = grey; cell.alignment = center
 
     units = data["units"]
     n = len(units)
     ds = refs["data_start"]
     S = refs["src_title"]
     auto_notes = _auto_notes(units)
+    d0, d1 = 4, 3 + n                        # data rows
 
-    # column map: A UNIT, B TENANT, C UNIT TYPE, D IN-PLACE, E MARKET, F LEASE TYPE,
-    # G LEASE START, H LEASE END, I IN-PLACE VACANCY, J LOSS TO LEASE, K ANNUAL, L NOTES
     for i, u in enumerate(units):
-        wr = 2 + i           # worksheet row
-        sr = ds + i          # matching Source row
+        r = d0 + i
+        sr = ds + i                          # matching Source row
         vac = _is_vacant(u)
-        ws.cell(wr, 1, f"='{S}'!A{sr}").alignment = Alignment(horizontal="center")
-        ws.cell(wr, 2, "VACANT" if vac else f"='{S}'!E{sr}")
-        ws.cell(wr, 3, _norm_type(u.get("unit_type", "")))          # single UNIT TYPE (normalized)
-        d = ws.cell(wr, 4, 0 if vac else f"='{S}'!C{sr}"); d.number_format = MONEY   # IN-PLACE
-        e = ws.cell(wr, 5, None); e.number_format = MONEY           # MARKET RENT — input
-        ws.cell(wr, 6, u.get("lease_type", ""))
-        ws.cell(wr, 7, f"='{S}'!G{sr}")                             # LEASE START (source move-in)
-        ws.cell(wr, 8, u.get("lease_end", ""))
-        iv = ws.cell(wr, 9, f"='{S}'!C{sr}" if vac else 0); iv.number_format = MONEY_DASH  # IN-PLACE VACANCY
-        jl = ws.cell(wr, 10, f'=IF(E{wr}="",0,E{wr}-D{wr})'); jl.number_format = MONEY_DASH   # LOSS TO LEASE
-        ka = ws.cell(wr, 11, f"=D{wr}*12"); ka.number_format = MONEY0                          # ANNUAL IN-PLACE
-        ws.cell(wr, 12, u["notes"] if "notes" in u else auto_notes.get(i, ""))
+        sf = u.get("unit_sf")
+        ws.cell(r, 1, f"='{S}'!A{sr}").alignment = center
+        ws.cell(r, 2, "VACANT" if vac else f"='{S}'!E{sr}")
+        ws.cell(r, 3, _norm_type(u.get("unit_type", "")))
+        if sf:
+            ws.cell(r, 4, float(sf)).number_format = "#,##0"
+        c = ws.cell(r, 5, f'=IF(OR(D{r}="",SUM($D${d0}:$D${d1})=0),"",D{r}/SUM($D${d0}:$D${d1}))')
+        c.number_format = "0.0%"
+        ws.cell(r, 6, f'=IF(OR(D{r}="",D{r}=0,G{r}=""),"",G{r}/D{r})').number_format = MONEY
+        g = ws.cell(r, 7, 0 if vac else f"='{S}'!C{sr}"); g.number_format = MONEY
+        ws.cell(r, 8, f'=IF(OR(D{r}="",D{r}=0,I{r}=""),"",I{r}/D{r})').number_format = MONEY
+        # market $ defaults: vacant -> target/asking from Source; else = in-place (edit over it)
+        mi = ws.cell(r, 9, f"='{S}'!C{sr}" if vac else f"=G{r}"); mi.number_format = MONEY
+        ws.cell(r, 10, u.get("lease_type", ""))
+        ws.cell(r, 11, f"='{S}'!G{sr}").alignment = Alignment(horizontal="right")
+        ws.cell(r, 12, u.get("lease_end", "")).alignment = Alignment(horizontal="right")
+        # user-specified formulas, verbatim (row-adjusted)
+        ws.cell(r, 13, f'=IF(B{r}="Vacant",I{r},0)').number_format = MONEY_DASH
+        ws.cell(r, 14, f"=IF(M{r}>0,0,I{r}-G{r})").number_format = MONEY_DASH
+        ws.cell(r, 15, u["notes"] if "notes" in u else auto_notes.get(i, ""))
+        for c_ in range(1, 16):
+            ws.cell(r, c_).border = hairline
         if vac:
-            for c in range(1, 13):
-                ws.cell(wr, c).fill = peach
-                if ws.cell(wr, c).value in (None, 0) or c in (1, 2, 3):
-                    ws.cell(wr, c).font = Font(italic=True, color="C00000")
+            for c_ in (1, 2, 3, 7, 9):
+                ws.cell(r, c_).font = redi
 
-    last = 1 + n
-    # Monthly Total — sum IN-PLACE(D), MARKET(E), VACANCY(I), LOSS(J), ANNUAL(K)
-    mt = last + 1
+    # ── totals ───────────────────────────────────────────────────────────
+    mt = d1 + 2
     ws.cell(mt, 1, "Monthly Total").font = bold
-    for col in (4, 5, 9, 10, 11):
+    for col in (7, 9, 13, 14):
         L = get_column_letter(col)
-        cell = ws.cell(mt, col, f"=SUM({L}2:{L}{last})")
+        cell = ws.cell(mt, col, f"=SUM({L}{d0}:{L}{d1})")
         cell.font = bold
-        cell.number_format = MONEY_DASH if col in (9, 10) else MONEY0
-    # Annual Total
+        cell.number_format = MONEY_DASH if col in (13, 14) else MONEY0
     at = mt + 1
     ws.cell(at, 1, "Annual Total").font = bold
-    for col, formula in ((4, f"=D{mt}*12"), (5, f"=E{mt}*12"),
-                         (9, f"=I{mt}*12"), (11, f"=K{mt}")):
-        cell = ws.cell(at, col, formula); cell.font = bold; cell.number_format = MONEY0
-    for r in (mt, at):
-        for c in range(1, 13):
-            ws.cell(r, c).fill = green
+    for col in (7, 9, 13):
+        L = get_column_letter(col)
+        cell = ws.cell(at, col, f"={L}{mt}*12"); cell.font = bold; cell.number_format = MONEY0
 
-    # Unit summary (references the Source sheet)
-    us = at + 2
-    summ = [("Total Units", refs["total_cell"], None),
-            ("Occupied Units", refs["occupied_cell"], None),
-            ("Vacant Units", refs["vacant_cell"], None),
+    # ── unit summary (linked to Source) ──────────────────────────────────
+    us = at + 3
+    summ = [("Total Units", refs["total_cell"], "0"),
+            ("Occupied Units", refs["occupied_cell"], "0"),
+            ("Vacant Units", refs["vacant_cell"], "0"),
             ("Occupancy", refs["occupancy_cell"], PCT)]
     for j, (label, ref, fmt) in enumerate(summ):
         rr = us + j
         ws.cell(rr, 2, label).font = bold
-        cell = ws.cell(rr, 4, f"={ref}")
-        if fmt:
-            cell.number_format = fmt
-        for c in range(2, 5):
-            ws.cell(rr, c).fill = green
+        cell = ws.cell(rr, 6, f"={ref}"); cell.number_format = fmt
+        for c_ in range(2, 8):
+            ws.cell(rr, c_).fill = green
 
-    # source note
     if data.get("source_note"):
         ws.cell(us + 5, 2, f"Source: {data['source_note']}  ·  "
-                           "Market Rent left blank for input; vacant unit shows target/asking rent.").font = note
+                           "Market Rent defaults to in-place — edit; vacant unit shows target/asking rent.").font = note
 
-    widths = [7, 20, 11, 15, 15, 11, 13, 12, 15, 14, 17, 34]
+    widths = [6, 18, 9, 9, 7, 9, 12, 9, 12, 26, 11, 10, 13, 12, 30]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
-    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = "A4"
 
 
-def build_into(wb, data: dict, name="Worksheet", src_name="Source") -> dict:
-    """Write the Worksheet + Source pair into an existing workbook. Returns the
-    Source refs (GPR/occupancy/unit-count cells) for cross-sheet linking."""
+def build_into(wb, data: dict, name="Worksheet", src_name="Source", prop_info=None) -> dict:
+    """Write the Worksheet + Source pair (and an optional Property Info cover
+    sheet) into an existing workbook. Returns the Source refs for linking."""
+    if prop_info:
+        from tools import prop_info as PI
+        PI.build_sheet(wb.create_sheet("Property Info"), prop_info)
     ws = wb.create_sheet(name)
     src = wb.create_sheet(src_name)
     refs = _build_source(src, data)
@@ -410,12 +433,12 @@ def build_into(wb, data: dict, name="Worksheet", src_name="Source") -> dict:
     return refs
 
 
-def build_workbook(data: dict) -> bytes:
-    """Return .xlsx bytes: a Worksheet tab (underwriting format, sourced) followed
-    by a Source tab (faithful transcription the Worksheet links back to)."""
+def build_workbook(data: dict, prop_info=None) -> bytes:
+    """Return .xlsx bytes: optional Property Info cover, the Worksheet tab
+    (underwriting format, sourced), and the Source tab it links back to."""
     from openpyxl import Workbook
     wb = Workbook(); wb.remove(wb.active)
-    build_into(wb, data)
+    build_into(wb, data, prop_info=prop_info)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
@@ -424,11 +447,12 @@ def _df_from_units(units):
     notes = _auto_notes(units)
     return pd.DataFrame([{
         "Unit": u.get("unit", ""), "Unit Type": u.get("unit_type", ""),
+        "SF": (float(u["unit_sf"]) if u.get("unit_sf") else None),
         "Monthly Rent": _num(u.get("monthly_rent")),
         "Status": "Vacant" if _is_vacant(u) else "Occupied",
         "Lease Name": u.get("lease_name", ""), "Lease Status": u.get("lease_status", ""),
         "Move-In Date": u.get("move_in_date", ""), "Lease End": u.get("lease_end", ""),
-        "Lease Type": u.get("lease_type", ""), "Notes": notes.get(i, ""),
+        "Lease Term": u.get("lease_type", ""), "Notes": notes.get(i, ""),
     } for i, u in enumerate(units)], columns=UNIT_COLS)
 
 
@@ -438,12 +462,14 @@ def _units_from_df(df):
         d = dict(zip(UNIT_COLS, row))
         if not str(d["Unit"]).strip():
             continue
+        sf = d.get("SF")
         out.append({
             "unit": str(d["Unit"]).strip(), "unit_type": str(d["Unit Type"]).strip(),
+            "unit_sf": (float(sf) if sf is not None and pd.notna(sf) and _num(sf) > 0 else None),
             "monthly_rent": _num(d["Monthly Rent"]), "status": str(d["Status"]).strip(),
             "lease_name": str(d["Lease Name"]).strip(), "lease_status": str(d["Lease Status"]).strip(),
             "move_in_date": str(d["Move-In Date"]).strip(), "lease_end": str(d["Lease End"]).strip(),
-            "lease_type": str(d["Lease Type"]).strip(), "notes": str(d["Notes"]).strip(),
+            "lease_type": str(d["Lease Term"]).strip(), "notes": str(d["Notes"]).strip(),
         })
     return out
 
@@ -493,6 +519,40 @@ def render():
             apn = c3.text_input("APN", value=data.get("apn") or "", key=f"apn_{key}")
             snote = st.text_input("Source note", value=data.get("source_note") or "", key=f"sn_{key}")
 
+            # ── Property Info cover sheet (web lookup by APN) ────────────
+            from tools import prop_info as PI
+            if st.button("🔎 Look up property info on the web (by APN)", key=f"pib_{key}",
+                         disabled=not apn.strip()):
+                with st.spinner(f"Researching APN {apn} on the web…"):
+                    try:
+                        st.session_state[f"pinfo_{key}"] = PI.fetch(apn, f"{pname} {csz}")
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Lookup failed: {e}")
+            pinfo = st.session_state.get(f"pinfo_{key}")
+            if pinfo is not None:
+                st.markdown("**Property Info** (from web — verify & edit; blanks stay "
+                            "blank on the sheet)")
+                pi_edit = {}
+                left, mid_, right_ = st.columns(3)
+                cols3 = [left, mid_, right_]
+                fields = PI.PROP_FIELDS[:2] + [("", "address_line2")] + PI.PROP_FIELDS[2:] + PI.BLDG_FIELDS
+                for j, (label, k) in enumerate(fields):
+                    v = pinfo.get(k)
+                    pi_edit[k] = cols3[j % 3].text_input(label or "Address line 2",
+                                                         value="" if v is None else str(v),
+                                                         key=f"pif_{k}_{key}")
+                # numbers back to numbers where possible
+                for k, v in pi_edit.items():
+                    v = v.strip()
+                    if v == "":
+                        pi_edit[k] = None
+                    else:
+                        try:
+                            pi_edit[k] = float(v) if "." in v else int(v)
+                        except ValueError:
+                            pi_edit[k] = v
+                st.session_state[f"pinfo_edit_{key}"] = pi_edit
+
             st.markdown("**Units** (edit any cell to correct the extraction)")
             df = st.data_editor(_df_from_units(data["units"]), num_rows="dynamic",
                                 use_container_width=True, key=f"units_{key}")
@@ -501,7 +561,7 @@ def render():
                       "source_note": snote, "units": _units_from_df(df)}
 
             if edited["units"]:
-                xlsx = build_workbook(edited)
+                xlsx = build_workbook(edited, prop_info=st.session_state.get(f"pinfo_edit_{key}"))
                 stem = re.sub(r'[^0-9A-Za-z]+', "_", (pname or f.name)).strip("_") or "rent_roll"
                 st.download_button("⬇ Download workbook (.xlsx)", data=xlsx,
                                    file_name=f"{stem}_RentRoll.xlsx",
