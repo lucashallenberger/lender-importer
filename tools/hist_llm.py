@@ -259,3 +259,70 @@ def classify_labels(labels):
                 break
         _save_cache(cache)
     return out
+
+
+# ---------------------------------------------------------------- 4) row roles
+def label_roles(labels):
+    """Classify each label's ROLE on an income statement: 'total' (any total,
+    subtotal, or net line — 'Total X', 'Net Operating Income', 'NOI', 'Gross
+    Income', 'Net Income'), 'section' (a bare header with no amount like 'Income'
+    or 'Expenses'), or 'item' (a normal line item). Returns {label: role}.
+    Cached in hist_learned.json under 'roles'."""
+    if not labels:
+        return {}
+    cache = _load_cache(); cache.setdefault("roles", {})
+    out, todo = {}, []
+    for l in labels:
+        if l in cache["roles"]:
+            out[l] = cache["roles"][l]
+        else:
+            todo.append(l)
+    if todo:
+        schema = {
+            "type": "object",
+            "properties": {"items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "role": {"type": "string", "enum": ["item", "total", "section"]},
+                    },
+                    "required": ["label", "role"],
+                    "additionalProperties": False,
+                },
+            }},
+            "required": ["items"], "additionalProperties": False,
+        }
+
+        def ask(labels):
+            prompt = (
+                "For each property income-statement line label, give its ROLE:\n"
+                "- 'total' for any total, subtotal, or net line (e.g. 'Total Income', "
+                "'Total Expenses', 'Total Operating Expenses', 'Net Operating Income', "
+                "'NOI', 'Gross Income', 'Net Income')\n"
+                "- 'section' for a bare section header with no amount (e.g. 'Income', "
+                "'Expenses', 'Operating Expenses')\n"
+                "- 'item' for a normal line item\n"
+                "Echo every label EXACTLY as given, one entry per label, no additions.\n\n"
+                f"Labels:\n{json.dumps(labels, indent=1)}"
+            )
+            resp = _client().messages.create(
+                model=MODEL, max_tokens=8000, thinking={"type": "adaptive"},
+                messages=[{"role": "user", "content": prompt}],
+                output_config={"format": {"type": "json_schema", "schema": schema}},
+            )
+            return _json_response(resp)["items"]
+
+        pending = list(todo)
+        for _attempt in range(2):
+            pset = set(pending)
+            for m in ask(pending):
+                if m["label"] in pset:
+                    out[m["label"]] = m["role"]
+                    cache["roles"][m["label"]] = m["role"]
+            pending = [l for l in pending if l not in out]
+            if not pending:
+                break
+        _save_cache(cache)
+    return out

@@ -10,13 +10,15 @@ import difflib
 
 import pdfplumber
 import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 CUR = '#,##0.00'
 RED = Font(color='C00000'); REDB = Font(color='C00000', bold=True)
 BOLD = Font(bold=True); PLAIN = Font()
 HDR = Font(bold=True, color='FFFFFF'); HFILL = PatternFill('solid', fgColor='4F46E5')
+TOTAL_FILL = PatternFill('solid', fgColor='EEF0FF')   # very light indigo band
+TOTAL_TOP = Border(top=Side(style='thin', color='9CA3AF'))
 
 _ROW = re.compile(r'^(.*?)\s+(-?\$[\d,]+\.\d{2})(?:\s+-?\$[\d,]+\.\d{2})?\s*$')
 _TXN = re.compile(r'^([A-Za-z]{2,12})\s+(\d{1,2}/\d{1,2}/\d{4})\s+.*?(-?\$[\d,]+\.\d{2})\s+(-?\$[\d,]+\.\d{2})\s*$')
@@ -133,13 +135,14 @@ def classify(label):
 
 # ---------------------------------------------------------------- assemble
 def _llm_refine(summaries, detail):
-    """Ask Claude to (a) align variant names onto the newest summary's labels and
-    (b) classify all line items. Returns (alias_map canon->canon, class_map
-    canon->class). Empty maps when no API key / any failure."""
+    """Ask Claude to (a) align variant names onto the newest summary's labels,
+    (b) classify all line items, and (c) flag which labels are total/subtotal/net
+    rows. Returns (alias_map canon->canon, class_map canon->class, total_keys set
+    of canon labels). Empty when no API key / any failure."""
     try:
         from tools import hist_llm
         if not hist_llm.available():
-            return {}, {}
+            return {}, {}, set()
         spine_labels = [r['label'] for r in (summaries[-1]['rows'] if summaries else [])
                         if r.get('amount') is not None and not r.get('total') and not r.get('net')]
         spine_keys = {canon(l) for l in spine_labels}
@@ -156,16 +159,21 @@ def _llm_refine(summaries, detail):
                 amap[canon(src)] = canon(tgt)
         all_items = sorted({*spine_labels, *others})
         cmap = {canon(l): c for l, c in hist_llm.classify_labels(all_items).items()}
-        return amap, cmap
+        # every label (incl. totals/sections) so Claude can flag total rows to bold
+        every = sorted({r['label'] for sm in summaries for r in sm['rows']}
+                       | ({*detail['cats'], *(detail['totals'] or {})} if detail else set()))
+        tset = {canon(l) for l, role in hist_llm.label_roles(every).items() if role == 'total'}
+        return amap, cmap, tset
     except Exception:
-        return {}, {}
+        return {}, {}, set()
 
 
 def build_workbook(summaries, detail, use_llm=True):
     """summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
-    use_llm: when an ANTHROPIC_API_KEY is available, Claude aligns variant names
-    and classifies line items; otherwise the deterministic rules run alone."""
-    amap, cmap = _llm_refine(summaries, detail) if use_llm else ({}, {})
+    use_llm: when an ANTHROPIC_API_KEY is available, Claude aligns variant names,
+    classifies line items, and flags total rows to bold; otherwise the
+    deterministic rules run alone."""
+    amap, cmap, tset = _llm_refine(summaries, detail) if use_llm else ({}, {}, set())
 
     def C(s):
         k = canon(s)
@@ -185,8 +193,32 @@ def build_workbook(summaries, detail, use_llm=True):
     for name in cats:
         if C(name) not in seen:
             extras.append({'label': name, 'amount': 0.0, '_only': detail['label']}); seen.add(C(name))
-    ins = next((i for i, r in enumerate(spine) if r.get('label', '').lower() == 'total expense'), len(spine))
-    spine = spine[:ins] + extras + spine[ins:]
+
+    # Insert each extra NEXT TO the spine items it belongs with (same classification,
+    # else same top-level group) instead of dumping them all at the bottom. Keeps a
+    # line like "Computer Expenses" among the expenses rather than below the totals.
+    def _cls(lbl):
+        return cmap.get(canon(lbl)) or classify(lbl)
+
+    def _grp(lbl):
+        return _cls(lbl).split(' - ')[0]
+
+    def _is_break(r):        # totals/nets/sections are not item rows
+        return bool(r.get('total') or r.get('net') or r.get('section'))
+
+    for ex in extras:
+        cls, grp = _cls(ex['label']), _grp(ex['label'])
+        pos = None
+        for i, r in enumerate(spine):        # after the last item sharing the class
+            if not _is_break(r) and _cls(r['label']) == cls:
+                pos = i + 1
+        if pos is None:                       # else after the last item in the group
+            for i, r in enumerate(spine):
+                if not _is_break(r) and _grp(r['label']) == grp:
+                    pos = i + 1
+        if pos is None:                       # else before the first total (still an item)
+            pos = next((i for i, r in enumerate(spine) if _is_break(r)), len(spine))
+        spine.insert(pos, ex)
 
     months = detail['months'] if detail else []
     nM = len(months)
@@ -260,10 +292,13 @@ def build_workbook(summaries, detail, use_llm=True):
     for cc, _srcc, hdr in CMP:
         comb.cell(1, cc, hdr)
 
+    total_rows = []
     for i, r in enumerate(spine):
         row = i + 2
         label = r['label']
-        is_tot = bool(r.get('total') or r.get('net')); is_sec = bool(r.get('section'))
+        is_tot = bool(r.get('total') or r.get('net') or canon(label) in tset); is_sec = bool(r.get('section'))
+        if is_tot:
+            total_rows.append(row)
 
         # write source tabs
         for si, (sm, ws) in enumerate(stabs):
@@ -317,7 +352,7 @@ def build_workbook(summaries, detail, use_llm=True):
                 redf = not p26
             put(comb, row, cc, f"={get_column_letter(srcc)}{row}", red=redf, bold=is_tot).number_format = CUR
 
-    _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, detail is not None)
+    _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, detail is not None, total_rows)
     for _, ws in stabs:
         _format_src(ws, [2])
     if detail:
@@ -337,7 +372,7 @@ def _format_src(ws, vcols):
         ws.column_dimensions[get_column_letter(c)].width = 11
 
 
-def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail):
+def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail, total_rows=()):
     spacers = set()
     for si, Lc, Vc in sum_blocks:
         spacers.add(Vc + 1)
@@ -359,3 +394,14 @@ def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail
         comb.column_dimensions[get_column_letter(Lc)].width = 22
     if has_detail:
         comb.column_dimensions[get_column_letter(det_L)].width = 24
+
+    # Emphasize total/subtotal/net rows: a light band + a thin top rule so they
+    # read as summary lines (bold is already applied per-cell during the build).
+    maxc = comb.max_column
+    for r in total_rows:
+        for c in range(1, maxc + 1):
+            if c in spacers:
+                continue
+            cell = comb.cell(r, c)
+            cell.fill = TOTAL_FILL
+            cell.border = TOTAL_TOP
