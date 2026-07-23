@@ -313,7 +313,7 @@ def _build_worksheet(ws, data, refs):
     bold = Font(bold=True)
     note = Font(italic=True, size=9, color="808080")
 
-    headers = ["UNIT", "TENANT", "UNIT TYPE", "UNIT TYPE", "IN-PLACE RENT ($)",
+    headers = ["UNIT", "TENANT", "UNIT TYPE", "IN-PLACE RENT ($)",
                "MARKET RENT ($)", "LEASE TYPE", "LEASE START", "LEASE END",
                "IN-PLACE VACANCY", "LOSS TO LEASE", "ANNUAL IN-PLACE RENT", "NOTES"]
     for c, h in enumerate(headers, start=1):
@@ -326,46 +326,47 @@ def _build_worksheet(ws, data, refs):
     ds = refs["data_start"]
     auto_notes = _auto_notes(units)
 
+    # column map: A UNIT, B TENANT, C UNIT TYPE, D IN-PLACE, E MARKET, F LEASE TYPE,
+    # G LEASE START, H LEASE END, I IN-PLACE VACANCY, J LOSS TO LEASE, K ANNUAL, L NOTES
     for i, u in enumerate(units):
         wr = 2 + i           # worksheet row
         sr = ds + i          # matching Source row
         vac = _is_vacant(u)
         ws.cell(wr, 1, f"='Source'!A{sr}").alignment = Alignment(horizontal="center")
         ws.cell(wr, 2, "VACANT" if vac else f"='Source'!E{sr}")
-        ws.cell(wr, 3, f"='Source'!B{sr}")
-        ws.cell(wr, 4, _norm_type(u.get("unit_type", "")))
-        e = ws.cell(wr, 5, 0 if vac else f"='Source'!C{sr}"); e.number_format = MONEY
-        f = ws.cell(wr, 6, None); f.number_format = MONEY          # Market Rent — input
-        ws.cell(wr, 7, u.get("lease_type", ""))
-        ws.cell(wr, 8, f"='Source'!G{sr}")
-        ws.cell(wr, 9, u.get("lease_end", ""))
-        jv = ws.cell(wr, 10, f"='Source'!C{sr}" if vac else 0); jv.number_format = MONEY_DASH
-        k = ws.cell(wr, 11, f'=IF(F{wr}="",0,F{wr}-E{wr})'); k.number_format = MONEY_DASH
-        li = ws.cell(wr, 12, f"=E{wr}*12"); li.number_format = MONEY0
-        ws.cell(wr, 13, u["notes"] if "notes" in u else auto_notes.get(i, ""))
+        ws.cell(wr, 3, _norm_type(u.get("unit_type", "")))          # single UNIT TYPE (normalized)
+        d = ws.cell(wr, 4, 0 if vac else f"='Source'!C{sr}"); d.number_format = MONEY   # IN-PLACE
+        e = ws.cell(wr, 5, None); e.number_format = MONEY           # MARKET RENT — input
+        ws.cell(wr, 6, u.get("lease_type", ""))
+        ws.cell(wr, 7, f"='Source'!G{sr}")                          # LEASE START (source move-in)
+        ws.cell(wr, 8, u.get("lease_end", ""))
+        iv = ws.cell(wr, 9, f"='Source'!C{sr}" if vac else 0); iv.number_format = MONEY_DASH  # IN-PLACE VACANCY
+        jl = ws.cell(wr, 10, f'=IF(E{wr}="",0,E{wr}-D{wr})'); jl.number_format = MONEY_DASH   # LOSS TO LEASE
+        ka = ws.cell(wr, 11, f"=D{wr}*12"); ka.number_format = MONEY0                          # ANNUAL IN-PLACE
+        ws.cell(wr, 12, u["notes"] if "notes" in u else auto_notes.get(i, ""))
         if vac:
-            for c in range(1, 14):
+            for c in range(1, 13):
                 ws.cell(wr, c).fill = peach
-                if ws.cell(wr, c).value in (None, 0) or c in (1, 2, 4):
+                if ws.cell(wr, c).value in (None, 0) or c in (1, 2, 3):
                     ws.cell(wr, c).font = Font(italic=True, color="C00000")
 
     last = 1 + n
-    # Monthly Total
+    # Monthly Total — sum IN-PLACE(D), MARKET(E), VACANCY(I), LOSS(J), ANNUAL(K)
     mt = last + 1
     ws.cell(mt, 1, "Monthly Total").font = bold
-    for col in (5, 6, 10, 11, 12):
+    for col in (4, 5, 9, 10, 11):
         L = get_column_letter(col)
         cell = ws.cell(mt, col, f"=SUM({L}2:{L}{last})")
         cell.font = bold
-        cell.number_format = MONEY0 if col == 12 else MONEY_DASH if col in (10, 11) else MONEY0
+        cell.number_format = MONEY_DASH if col in (9, 10) else MONEY0
     # Annual Total
     at = mt + 1
     ws.cell(at, 1, "Annual Total").font = bold
-    for col, formula in ((5, f"=E{mt}*12"), (6, f"=F{mt}*12"),
-                         (10, f"=J{mt}*12"), (12, f"=L{mt}")):
+    for col, formula in ((4, f"=D{mt}*12"), (5, f"=E{mt}*12"),
+                         (9, f"=I{mt}*12"), (11, f"=K{mt}")):
         cell = ws.cell(at, col, formula); cell.font = bold; cell.number_format = MONEY0
     for r in (mt, at):
-        for c in range(1, 14):
+        for c in range(1, 13):
             ws.cell(r, c).fill = green
 
     # Unit summary (references the Source sheet)
@@ -377,10 +378,10 @@ def _build_worksheet(ws, data, refs):
     for j, (label, ref, fmt) in enumerate(summ):
         rr = us + j
         ws.cell(rr, 2, label).font = bold
-        cell = ws.cell(rr, 5, f"={ref}")
+        cell = ws.cell(rr, 4, f"={ref}")
         if fmt:
             cell.number_format = fmt
-        for c in range(2, 6):
+        for c in range(2, 5):
             ws.cell(rr, c).fill = green
 
     # source note
@@ -388,7 +389,7 @@ def _build_worksheet(ws, data, refs):
         ws.cell(us + 5, 2, f"Source: {data['source_note']}  ·  "
                            "Market Rent left blank for input; vacant unit shows target/asking rent.").font = note
 
-    widths = [7, 20, 10, 10, 15, 15, 11, 13, 12, 15, 14, 17, 34]
+    widths = [7, 20, 11, 15, 15, 11, 13, 12, 15, 14, 17, 34]
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
     ws.row_dimensions[1].height = 30
