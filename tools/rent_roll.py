@@ -12,6 +12,7 @@ plumbing as the Historicals tool; degrades to a clear message if no API key.
 
 import io
 import re
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
@@ -140,6 +141,70 @@ def _num(x):
         return 0.0
 
 
+def _beds(u):
+    """Bedroom count from the unit type; Studio/Single -> 0, else leading int."""
+    s = str(u.get("unit_type", "")).lower()
+    if "studio" in s or "single" in s:
+        return 0
+    m = re.match(r'\s*(\d+)', s)
+    return int(m.group(1)) if m else None
+
+
+def _movein(u):
+    s = str(u.get("move_in_date", "")).strip()
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _auto_notes(units):
+    """Analytical flags per unit (biggest/smallest, highest/lowest rent, tenure,
+    vacancy) — written into the Notes column instead of extra columns.
+    Returns {index: note-string}. Only labels a superlative when it's unique."""
+    n = len(units)
+    tags = {i: [] for i in range(n)}
+
+    for i, u in enumerate(units):
+        if _is_vacant(u):
+            tags[i].append("Vacant — target/asking rent")
+
+    # biggest / smallest unit by bedroom count (only when there's a mix)
+    beds = {i: _beds(u) for i, u in enumerate(units)}
+    known = [v for v in beds.values() if v is not None]
+    if known and len(set(known)) > 1:
+        big = [i for i, v in beds.items() if v == max(known)]
+        small = [i for i, v in beds.items() if v == min(known)]
+        if len(big) == 1:
+            tags[big[0]].append("Biggest unit")
+        if len(small) == 1:
+            tags[small[0]].append("Smallest unit")
+
+    # highest / lowest in-place rent among occupied units with a real rent
+    rents = {i: _num(u.get("monthly_rent")) for i, u in enumerate(units)
+             if not _is_vacant(u) and _num(u.get("monthly_rent")) > 0}
+    if len(rents) > 1:
+        hi = max(rents, key=rents.get)
+        lo = min(rents, key=rents.get)
+        tags[hi].append("Highest rent")
+        if lo != hi:
+            tags[lo].append("Lowest rent")
+
+    # longest-tenured / newest lease among occupied units with a parseable date
+    dates = {i: _movein(u) for i, u in enumerate(units)
+             if not _is_vacant(u) and _movein(u)}
+    if len(dates) > 1:
+        oldest = min(dates, key=dates.get)
+        newest = max(dates, key=dates.get)
+        tags[oldest].append("Longest-tenured")
+        if newest != oldest:
+            tags[newest].append("Newest lease")
+
+    return {i: " · ".join(t) for i, t in tags.items()}
+
+
 # ── workbook: Source sheet (faithful transcription) ─────────────────────────
 def _build_source(ws, data):
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -259,6 +324,7 @@ def _build_worksheet(ws, data, refs):
     units = data["units"]
     n = len(units)
     ds = refs["data_start"]
+    auto_notes = _auto_notes(units)
 
     for i, u in enumerate(units):
         wr = 2 + i           # worksheet row
@@ -276,7 +342,7 @@ def _build_worksheet(ws, data, refs):
         jv = ws.cell(wr, 10, f"='Source'!C{sr}" if vac else 0); jv.number_format = MONEY_DASH
         k = ws.cell(wr, 11, f'=IF(F{wr}="",0,F{wr}-E{wr})'); k.number_format = MONEY_DASH
         li = ws.cell(wr, 12, f"=E{wr}*12"); li.number_format = MONEY0
-        ws.cell(wr, 13, "Target/asking rent" if vac else "")
+        ws.cell(wr, 13, u["notes"] if "notes" in u else auto_notes.get(i, ""))
         if vac:
             for c in range(1, 14):
                 ws.cell(wr, c).fill = peach
@@ -342,14 +408,15 @@ def build_workbook(data: dict) -> bytes:
 
 # ── UI ───────────────────────────────────────────────────────────────────────
 def _df_from_units(units):
+    notes = _auto_notes(units)
     return pd.DataFrame([{
         "Unit": u.get("unit", ""), "Unit Type": u.get("unit_type", ""),
         "Monthly Rent": _num(u.get("monthly_rent")),
         "Status": "Vacant" if _is_vacant(u) else "Occupied",
         "Lease Name": u.get("lease_name", ""), "Lease Status": u.get("lease_status", ""),
         "Move-In Date": u.get("move_in_date", ""), "Lease End": u.get("lease_end", ""),
-        "Lease Type": u.get("lease_type", ""), "Notes": "",
-    } for u in units], columns=UNIT_COLS)
+        "Lease Type": u.get("lease_type", ""), "Notes": notes.get(i, ""),
+    } for i, u in enumerate(units)], columns=UNIT_COLS)
 
 
 def _units_from_df(df):
@@ -363,7 +430,7 @@ def _units_from_df(df):
             "monthly_rent": _num(d["Monthly Rent"]), "status": str(d["Status"]).strip(),
             "lease_name": str(d["Lease Name"]).strip(), "lease_status": str(d["Lease Status"]).strip(),
             "move_in_date": str(d["Move-In Date"]).strip(), "lease_end": str(d["Lease End"]).strip(),
-            "lease_type": str(d["Lease Type"]).strip(),
+            "lease_type": str(d["Lease Type"]).strip(), "notes": str(d["Notes"]).strip(),
         })
     return out
 
