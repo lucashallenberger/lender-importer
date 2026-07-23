@@ -98,7 +98,8 @@ def _fetch_once(apn: str, hint: str, zip_code: str) -> dict:
         thinking={"type": "adaptive"},
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
         messages=[{"role": "user", "content": _PROMPT.format(
-            apn=apn,
+            apn=apn.strip() or "unknown — determine it from the full address below "
+                               "(then treat that parcel as the subject)",
             zip_line=f"ZIP code: {zip_code.strip()}\n" if zip_code.strip() else "",
             hint=f"Known name/address hint: {hint}" if hint.strip() else "")}],
     )
@@ -109,12 +110,11 @@ def _fetch_once(apn: str, hint: str, zip_code: str) -> dict:
     return out
 
 
-def _last_json(text: str) -> dict:
+def _balanced_json(text: str, want: set, min_hits: int) -> dict:
     """Extract the final JSON object from a reply: scan '{' positions rightmost-
     first, take each balanced {...} span, and accept the first that parses to a
-    dict containing at least 3 of our known keys (guards against fragments and
-    nested sub-objects)."""
-    want = set(ALL_KEYS) | {"verified_address"}
+    dict containing at least min_hits of the wanted keys (guards against
+    fragments and nested sub-objects)."""
     starts = [m.start() for m in re.finditer(r"\{", text)]
     for s in reversed(starts):
         depth = 0
@@ -126,12 +126,52 @@ def _last_json(text: str) -> dict:
                 if depth == 0:
                     try:
                         d = json.loads(text[s:i + 1])
-                        if isinstance(d, dict) and len(set(d) & want) >= 3:
+                        if isinstance(d, dict) and len(set(d) & want) >= min_hits:
                             return d
                     except Exception:
                         pass
                     break
     return {}
+
+
+def _last_json(text: str) -> dict:
+    return _balanced_json(text, set(ALL_KEYS) | {"verified_address"}, 3)
+
+
+# ── address -> candidate properties (the "which 14 Brooks Ave?" dropdown) ────
+_CAND_PROMPT = """Find the U.S. property or properties matching this street
+address using web search.
+
+Street address: {address}
+{zip_line}
+The same street address can exist in many different cities. List EVERY distinct
+real property you can find matching this street address{zipnote}. For each:
+- address: the street address as commonly written
+- city_state_zip: e.g. "Venice, CA 90291"
+- county: county name, or null
+- apn: the parcel's APN if you can determine it, else null
+- note: one short identifying hint (e.g. "12-unit multifamily on LoopNet"), or null
+
+Output ONLY a JSON object (no text after it): {{"candidates": [ ... ]}}
+Max 6 candidates, most likely first."""
+
+
+def candidates(address: str, zip_code: str = "") -> list:
+    """Web-search an ambiguous street address; returns candidate property dicts
+    (address / city_state_zip / county / apn / note) for the user to pick from."""
+    resp = hist_llm._client().messages.create(
+        model=hist_llm.MODEL,
+        max_tokens=6000,
+        thinking={"type": "adaptive"},
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+        messages=[{"role": "user", "content": _CAND_PROMPT.format(
+            address=address,
+            zip_line=f"ZIP code (if known): {zip_code.strip()}\n" if zip_code.strip() else "",
+            zipnote=" (prioritize the given ZIP)" if zip_code.strip() else "")}],
+    )
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    d = _balanced_json(text, {"candidates"}, 1)
+    return [c for c in (d.get("candidates") or []) if isinstance(c, dict) and c.get("address")]
 
 
 def build_sheet(ws, info: dict):

@@ -257,17 +257,49 @@ def render():
                 zip_guess = m.group(1)
         if doc["kind"] == "tax_bill" and p and p["data"].get("apn") and not apn_guess:
             apn_guess = p["data"]["apn"]
-    c1, c2, c3 = st.columns([2, 1, 2])
-    apn_in = c1.text_input("APN", value=st.session_state.get("uw_apn", apn_guess), key="uw_apn")
-    zip_in = c2.text_input("ZIP code", value=st.session_state.get("uw_zip", zip_guess), key="uw_zip",
+    c1, c2, c3 = st.columns([2, 2, 1])
+    apn_in = c1.text_input("APN (best)", value=st.session_state.get("uw_apn", apn_guess), key="uw_apn")
+    addr_in = c2.text_input("Street address (if no APN)", key="uw_addr",
+                            placeholder="e.g. 14 Brooks Ave")
+    zip_in = c3.text_input("ZIP code", value=st.session_state.get("uw_zip", zip_guess), key="uw_zip",
                            help="Disambiguates the address — '14 Brooks Ave' exists in a dozen "
                                 "cities; the ZIP pins down which one is yours.")
-    if c3.button("🔎 Look up property info on the web", disabled=not (apn_in.strip() and ai_on)):
-        with st.spinner(f"Researching APN {apn_in}…"):
-            try:
-                st.session_state["uw_pinfo"] = PI.fetch(apn_in, zip_code=zip_in)
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Lookup failed: {e}")
+    if st.button("🔎 Look up property info on the web",
+                 disabled=not (ai_on and (apn_in.strip() or addr_in.strip()))):
+        if apn_in.strip():
+            st.session_state.pop("uw_cands", None)
+            with st.spinner(f"Researching APN {apn_in}…"):
+                try:
+                    st.session_state["uw_pinfo"] = PI.fetch(apn_in, hint=addr_in, zip_code=zip_in)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Lookup failed: {e}")
+        else:
+            # address only -> find candidates first, user picks the right city
+            with st.spinner(f"Finding properties matching “{addr_in}”…"):
+                try:
+                    st.session_state["uw_cands"] = PI.candidates(addr_in, zip_code=zip_in)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Search failed: {e}")
+    cands = st.session_state.get("uw_cands")
+    if cands:
+        labels = [f"{c.get('address')}, {c.get('city_state_zip') or '?'}"
+                  + (f" — APN {c['apn']}" if c.get("apn") else "")
+                  + (f"  ({c['note']})" if c.get("note") else "")
+                  for c in cands]
+        sel = st.selectbox("Multiple properties match — which one is yours?",
+                           range(len(labels)), format_func=lambda i: labels[i], key="uw_cand_sel")
+        if st.button("✓ Use this property"):
+            c = cands[sel]
+            zc = re.search(r"\b(\d{5})\b", c.get("city_state_zip") or "")
+            with st.spinner("Researching the selected property…"):
+                try:
+                    st.session_state["uw_pinfo"] = PI.fetch(
+                        c.get("apn") or "",
+                        hint=f"{c.get('address')}, {c.get('city_state_zip') or ''}",
+                        zip_code=zc.group(1) if zc else zip_in)
+                    st.session_state.pop("uw_cands", None)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Lookup failed: {e}")
     pinfo = st.session_state.get("uw_pinfo")
     if pinfo and pinfo.get("verified_address"):
         st.info(f"📍 Verified as: **{pinfo['verified_address']}** — if that's the wrong "
