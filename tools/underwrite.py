@@ -245,23 +245,33 @@ def render():
 
     # ── property info (APN web lookup) ───────────────────────────────────
     st.subheader("2 · Property info")
-    # prefill APN from whatever was parsed
-    apn_guess = ""
+    # prefill APN + ZIP from whatever was parsed
+    apn_guess, zip_guess = "", ""
     for doc in docs.values():
         p = doc.get("parsed")
-        if doc["kind"] == "rent_roll" and p and p.get("apn"):
-            apn_guess = p["apn"]; break
-        if doc["kind"] == "tax_bill" and p and p["data"].get("apn"):
+        if doc["kind"] == "rent_roll" and p:
+            if p.get("apn") and not apn_guess:
+                apn_guess = p["apn"]
+            m = re.search(r"\b(\d{5})\b", p.get("city_state_zip") or "")
+            if m and not zip_guess:
+                zip_guess = m.group(1)
+        if doc["kind"] == "tax_bill" and p and p["data"].get("apn") and not apn_guess:
             apn_guess = p["data"]["apn"]
-    c1, c2 = st.columns([2, 3])
+    c1, c2, c3 = st.columns([2, 1, 2])
     apn_in = c1.text_input("APN", value=st.session_state.get("uw_apn", apn_guess), key="uw_apn")
-    if c2.button("🔎 Look up property info on the web", disabled=not (apn_in.strip() and ai_on)):
+    zip_in = c2.text_input("ZIP code", value=st.session_state.get("uw_zip", zip_guess), key="uw_zip",
+                           help="Disambiguates the address — '14 Brooks Ave' exists in a dozen "
+                                "cities; the ZIP pins down which one is yours.")
+    if c3.button("🔎 Look up property info on the web", disabled=not (apn_in.strip() and ai_on)):
         with st.spinner(f"Researching APN {apn_in}…"):
             try:
-                st.session_state["uw_pinfo"] = PI.fetch(apn_in)
+                st.session_state["uw_pinfo"] = PI.fetch(apn_in, zip_code=zip_in)
             except Exception as e:  # noqa: BLE001
                 st.error(f"Lookup failed: {e}")
     pinfo = st.session_state.get("uw_pinfo")
+    if pinfo and pinfo.get("verified_address"):
+        st.info(f"📍 Verified as: **{pinfo['verified_address']}** — if that's the wrong "
+                "property, fix the ZIP and re-run the lookup.")
     if pinfo and review:
         cols3 = st.columns(3)
         fields = PI.PROP_FIELDS[:2] + [("Address line 2", "address_line2")] + PI.PROP_FIELDS[2:] + PI.BLDG_FIELDS

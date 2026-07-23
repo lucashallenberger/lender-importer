@@ -523,12 +523,17 @@ def render():
             from tools import prop_info as PI
             if st.button("🔎 Look up property info on the web (by APN)", key=f"pib_{key}",
                          disabled=not apn.strip()):
+                zc = re.search(r"\b(\d{5})\b", csz or "")
                 with st.spinner(f"Researching APN {apn} on the web…"):
                     try:
-                        st.session_state[f"pinfo_{key}"] = PI.fetch(apn, f"{pname} {csz}")
+                        st.session_state[f"pinfo_{key}"] = PI.fetch(
+                            apn, f"{pname} {csz}", zip_code=zc.group(1) if zc else "")
                     except Exception as e:  # noqa: BLE001
                         st.error(f"Lookup failed: {e}")
             pinfo = st.session_state.get(f"pinfo_{key}")
+            if pinfo and pinfo.get("verified_address"):
+                st.info(f"📍 Verified as: **{pinfo['verified_address']}** — wrong property? "
+                        "Fix the City/State/ZIP above and re-run the lookup.")
             if pinfo is not None:
                 st.markdown("**Property Info** (from web — verify & edit; blanks stay "
                             "blank on the sheet)")

@@ -35,15 +35,26 @@ ALL_KEYS = [k for _, k in PROP_FIELDS] + ["address_line2"] + [k for _, k in BLDG
 _PROMPT = """Research this property using web search and report what you find.
 
 APN (Assessor's Parcel Number): {apn}
-{hint}
+{zip_line}{hint}
 
 Check the county assessor's parcel records (for Los Angeles County: the LA County
 Assessor portal, and ZIMAS zimas.lacity.org for zoning), plus listing/data sites
-(Redfin, Zillow, LoopNet, PropertyShark) as needed. Prefer official assessor data
-when sources disagree.
+(Redfin, Zillow, LoopNet, PropertyShark) as needed.
+
+IDENTITY RULES — getting the RIGHT property matters more than filling fields:
+- The APN is the unique parcel id within its county: treat it as ground truth.
+- Street addresses are ambiguous (the same "14 Brooks Ave" exists in many
+  cities). Only use an address-based source if it matches the APN, or the full
+  address INCLUDING the ZIP code given above. If a source's city/ZIP conflicts
+  with the given ZIP, discard that source entirely — do not mix properties.
+- When sources disagree, prefer: county assessor > city planning (ZIMAS) >
+  listing sites.
+- If you cannot confirm a value is for THIS parcel, return null for it.
 
 When done, output ONLY a JSON object (no other text after it) with these keys —
 use null for anything you could not verify; do NOT guess:
+- verified_address: the full address (street, city, ZIP) you confirmed for this
+  APN — the user checks this to make sure you found the right property
 - property_name: short name, usually the street address (e.g. "2821 Sierra")
 - address_line1: street address (e.g. "2821 N SIERRA ST")
 - address_line2: city, state zip (e.g. "Lincoln Heights, CA 90031")
@@ -63,26 +74,64 @@ use null for anything you could not verify; do NOT guess:
 - leasable_sf: number or null"""
 
 
-def fetch(apn: str, hint: str = "") -> dict:
-    """Web-research the APN and return the property-info dict (missing keys None)."""
+def fetch(apn: str, hint: str = "", zip_code: str = "") -> dict:
+    """Web-research the APN and return the property-info dict (missing keys None).
+    zip_code disambiguates address-based sources (many cities share street names);
+    the result includes 'verified_address' so the user can confirm the match.
+    Web search is variable run to run — retries once if the first pass finds
+    little, and returns whichever attempt filled more fields."""
+    best = None
+    for _attempt in range(2):
+        out = _fetch_once(apn, hint, zip_code)
+        n = sum(1 for k in ALL_KEYS if out.get(k) is not None)
+        if best is None or n > best[0]:
+            best = (n, out)
+        if best[0] >= 6:                      # good enough — stop
+            break
+    return best[1]
+
+
+def _fetch_once(apn: str, hint: str, zip_code: str) -> dict:
     resp = hist_llm._client().messages.create(
         model=hist_llm.MODEL,
         max_tokens=8000,
         thinking={"type": "adaptive"},
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
         messages=[{"role": "user", "content": _PROMPT.format(
-            apn=apn, hint=f"Known name/address hint: {hint}" if hint.strip() else "")}],
+            apn=apn,
+            zip_line=f"ZIP code: {zip_code.strip()}\n" if zip_code.strip() else "",
+            hint=f"Known name/address hint: {hint}" if hint.strip() else "")}],
     )
     text = "".join(b.text for b in resp.content if b.type == "text")
-    # the answer ends with a flat JSON object (often ```json fenced) — take the last
-    info = {}
-    for raw in re.findall(r"\{[^{}]*\}", text, re.S)[::-1]:
-        try:
-            info = json.loads(raw)
-            break
-        except Exception:
-            continue
-    return {k: info.get(k) for k in ALL_KEYS}
+    info = _last_json(text)
+    out = {k: info.get(k) for k in ALL_KEYS}
+    out["verified_address"] = info.get("verified_address")
+    return out
+
+
+def _last_json(text: str) -> dict:
+    """Extract the final JSON object from a reply: scan '{' positions rightmost-
+    first, take each balanced {...} span, and accept the first that parses to a
+    dict containing at least 3 of our known keys (guards against fragments and
+    nested sub-objects)."""
+    want = set(ALL_KEYS) | {"verified_address"}
+    starts = [m.start() for m in re.finditer(r"\{", text)]
+    for s in reversed(starts):
+        depth = 0
+        for i in range(s, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        d = json.loads(text[s:i + 1])
+                        if isinstance(d, dict) and len(set(d) & want) >= 3:
+                            return d
+                    except Exception:
+                        pass
+                    break
+    return {}
 
 
 def build_sheet(ws, info: dict):
