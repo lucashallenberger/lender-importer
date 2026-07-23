@@ -1001,24 +1001,37 @@ def _write_combined(ws, bills):
                 pass
 
 
+def build_tax_into(wb, bills, prefix="", combined_name="Combined"):
+    """Write per-bill sheets (year-named, oldest→newest) + a combined sheet into an
+    existing workbook. Returns metadata for the NEWEST year-bearing bill so other
+    sheets can link its annual tax: {'sheet', 'hardcoded_cell', 'performula_cell'}."""
+    bills = sorted(bills, key=lambda b: (b[3] is None, b[3] or 0))
+    used, newest = set(), None
+    for i, (data, apn, shot, year) in enumerate(bills):
+        title = f"{prefix}{year}" if year else f"{prefix}Bill {i + 1}"
+        while title in used:            # guard against duplicate years
+            title += "*"
+        used.add(title)
+        last = write_bill(wb.create_sheet(title), data, apn, c0=0, screenshot_path=shot)
+        if year is not None or newest is None:
+            newest = {"sheet": title,
+                      "hardcoded_cell": f"'{title}'!B{last}",
+                      "performula_cell": f"'{title}'!B{last - 1}"}
+    if len(bills) > 1:
+        _write_combined(wb.create_sheet(combined_name), bills)
+    return newest
+
+
 def build_combined_workbook(bills):
     """bills: list of (data, apn, shot_path, year). Returns .xlsx bytes with one
     sheet per bill (named by tax year, oldest→newest) plus a Combined sheet: bills
     in aligned columns and a COMBINED column that adds them up (live SUM formulas)."""
     from openpyxl import Workbook
-
-    # Order oldest → newest; bills without a year sink to the end (stable).
-    bills = sorted(bills, key=lambda b: (b[3] is None, b[3] or 0))
-
     wb = Workbook(); wb.remove(wb.active)
-    used = set()
-    for i, (data, apn, shot, year) in enumerate(bills):
-        title = str(year) if year else f"Bill {i + 1}"
-        while title in used:            # guard against duplicate years
-            title += "*"
-        used.add(title)
-        write_bill(wb.create_sheet(title), data, apn, c0=0, screenshot_path=shot)
-    _write_combined(wb.create_sheet("Combined"), bills)
+    build_tax_into(wb, bills)
+    if len(bills) == 1:                 # standalone tool always shows Combined
+        _write_combined(wb["Combined"] if "Combined" in wb.sheetnames else wb.create_sheet("Combined"),
+                        sorted(bills, key=lambda b: (b[3] is None, b[3] or 0)))
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 

@@ -184,8 +184,10 @@ def _llm_refine(summaries, detail):
         return {}, {}, set()
 
 
-def build_workbook(summaries, detail, use_llm=True):
-    """summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
+def build_into(wb, summaries, detail, use_llm=True, combined_title='Combined'):
+    """Write the combined + source sheets into an existing workbook. Returns
+    metadata for cross-sheet linking (classification SUMIFs on the combined tab).
+    summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
     use_llm: when an ANTHROPIC_API_KEY is available, Claude aligns variant names,
     classifies line items, and flags total rows to bold; otherwise the
     deterministic rules run alone."""
@@ -260,8 +262,7 @@ def build_workbook(summaries, detail, use_llm=True):
     ncols = [max((len(r.get('amounts') or [0]) for r in sm['rows'] if r.get('amount') is not None), default=1)
              for sm in summaries]
 
-    wb = openpyxl.Workbook()
-    comb = wb.active; comb.title = 'Combined'
+    comb = wb.create_sheet(combined_title)
     stabs = []
     for si, sm in enumerate(summaries):
         ws = wb.create_sheet(sm['label'][:31])
@@ -387,6 +388,21 @@ def build_workbook(summaries, detail, use_llm=True):
     if detail:
         _format_src(dtab, list(range(2, 2 + nM + 1)))
 
+    return {
+        'title': combined_title,
+        'first_row': 2, 'last_row': len(spine) + 1,
+        'cls_letter': 'A',
+        'val_letter': (get_column_letter(det_T) if detail
+                       else (get_column_letter(sum_val_cols[-1]) if sum_val_cols else None)),
+        'val_months': nM if detail else 12,
+        'val_label': detail['label'] if detail else (summaries[-1]['label'] if summaries else ''),
+    }
+
+
+def build_workbook(summaries, detail, use_llm=True):
+    """Standalone: build a fresh workbook and return .xlsx bytes."""
+    wb = openpyxl.Workbook(); wb.remove(wb.active)
+    build_into(wb, summaries, detail, use_llm)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 

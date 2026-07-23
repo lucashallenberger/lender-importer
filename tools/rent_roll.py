@@ -292,12 +292,16 @@ def _build_source(ws, data):
     for c, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(c)].width = w
 
+    src = ws.title
     return {
+        "src_title": src,
         "data_start": ds, "data_end": de,
-        "occupancy_cell": f"'Source'!C{sr+4}",
-        "total_cell": f"'Source'!C{sr+1}",
-        "occupied_cell": f"'Source'!C{sr+2}",
-        "vacant_cell": f"'Source'!C{sr+3}",
+        "occupancy_cell": f"'{src}'!C{sr+4}",
+        "total_cell": f"'{src}'!C{sr+1}",
+        "occupied_cell": f"'{src}'!C{sr+2}",
+        "vacant_cell": f"'{src}'!C{sr+3}",
+        "gpr_monthly_cell": f"'{src}'!C{sr+7}",
+        "gpr_annual_cell": f"'{src}'!C{sr+8}",
     }
 
 
@@ -324,6 +328,7 @@ def _build_worksheet(ws, data, refs):
     units = data["units"]
     n = len(units)
     ds = refs["data_start"]
+    S = refs["src_title"]
     auto_notes = _auto_notes(units)
 
     # column map: A UNIT, B TENANT, C UNIT TYPE, D IN-PLACE, E MARKET, F LEASE TYPE,
@@ -332,15 +337,15 @@ def _build_worksheet(ws, data, refs):
         wr = 2 + i           # worksheet row
         sr = ds + i          # matching Source row
         vac = _is_vacant(u)
-        ws.cell(wr, 1, f"='Source'!A{sr}").alignment = Alignment(horizontal="center")
-        ws.cell(wr, 2, "VACANT" if vac else f"='Source'!E{sr}")
+        ws.cell(wr, 1, f"='{S}'!A{sr}").alignment = Alignment(horizontal="center")
+        ws.cell(wr, 2, "VACANT" if vac else f"='{S}'!E{sr}")
         ws.cell(wr, 3, _norm_type(u.get("unit_type", "")))          # single UNIT TYPE (normalized)
-        d = ws.cell(wr, 4, 0 if vac else f"='Source'!C{sr}"); d.number_format = MONEY   # IN-PLACE
+        d = ws.cell(wr, 4, 0 if vac else f"='{S}'!C{sr}"); d.number_format = MONEY   # IN-PLACE
         e = ws.cell(wr, 5, None); e.number_format = MONEY           # MARKET RENT — input
         ws.cell(wr, 6, u.get("lease_type", ""))
-        ws.cell(wr, 7, f"='Source'!G{sr}")                          # LEASE START (source move-in)
+        ws.cell(wr, 7, f"='{S}'!G{sr}")                             # LEASE START (source move-in)
         ws.cell(wr, 8, u.get("lease_end", ""))
-        iv = ws.cell(wr, 9, f"='Source'!C{sr}" if vac else 0); iv.number_format = MONEY_DASH  # IN-PLACE VACANCY
+        iv = ws.cell(wr, 9, f"='{S}'!C{sr}" if vac else 0); iv.number_format = MONEY_DASH  # IN-PLACE VACANCY
         jl = ws.cell(wr, 10, f'=IF(E{wr}="",0,E{wr}-D{wr})'); jl.number_format = MONEY_DASH   # LOSS TO LEASE
         ka = ws.cell(wr, 11, f"=D{wr}*12"); ka.number_format = MONEY0                          # ANNUAL IN-PLACE
         ws.cell(wr, 12, u["notes"] if "notes" in u else auto_notes.get(i, ""))
@@ -395,15 +400,22 @@ def _build_worksheet(ws, data, refs):
     ws.row_dimensions[1].height = 30
 
 
+def build_into(wb, data: dict, name="Worksheet", src_name="Source") -> dict:
+    """Write the Worksheet + Source pair into an existing workbook. Returns the
+    Source refs (GPR/occupancy/unit-count cells) for cross-sheet linking."""
+    ws = wb.create_sheet(name)
+    src = wb.create_sheet(src_name)
+    refs = _build_source(src, data)
+    _build_worksheet(ws, data, refs)
+    return refs
+
+
 def build_workbook(data: dict) -> bytes:
     """Return .xlsx bytes: a Worksheet tab (underwriting format, sourced) followed
     by a Source tab (faithful transcription the Worksheet links back to)."""
     from openpyxl import Workbook
     wb = Workbook(); wb.remove(wb.active)
-    ws = wb.create_sheet("Worksheet")
-    src = wb.create_sheet("Source")
-    refs = _build_source(src, data)
-    _build_worksheet(ws, data, refs)
+    build_into(wb, data)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
