@@ -20,8 +20,9 @@ HDR = Font(bold=True, color='FFFFFF'); HFILL = PatternFill('solid', fgColor='4F4
 TOTAL_FILL = PatternFill('solid', fgColor='EEF0FF')   # very light indigo band
 TOTAL_TOP = Border(top=Side(style='thin', color='9CA3AF'))
 
-_ROW = re.compile(r'^(.*?)\s+(-?\$[\d,]+\.\d{2})(?:\s+-?\$[\d,]+\.\d{2})?\s*$')
-_TXN = re.compile(r'^([A-Za-z]{2,12})\s+(\d{1,2}/\d{1,2}/\d{4})\s+.*?(-?\$[\d,]+\.\d{2})\s+(-?\$[\d,]+\.\d{2})\s*$')
+_ROW = re.compile(r'^(.*?)\s+((?:-?\$[\d,]+\.\d{2})(?:\s+-?\$[\d,]+\.\d{2})*)\s*$')
+# type may be multi-word: "Journal Entry", "Credit Memo", "Prepayment Application"
+_TXN = re.compile(r'^([A-Za-z][A-Za-z ]{0,24}?)\s+(\d{1,2}/\d{1,2}/\d{4})\s+.*?(-?\$[\d,]+\.\d{2})\s+(-?\$[\d,]+\.\d{2})\s*$')
 _HEADER = re.compile(r'^(.+?)\s*\((\d{3,6})\)\s*$')
 _TOTAL = re.compile(r'^Total\s+(.+?)\s+(-?\$[\d,]+\.\d{2})\s*$')
 _MONEY = re.compile(r'-?\$[\d,]+\.\d{2}')
@@ -55,9 +56,10 @@ def parse_summary(data):
         if not s:
             continue
         m = _ROW.match(s)
-        if m:
+        if m and m.group(1).strip():
             label = m.group(1).strip()
-            rows.append({'label': label, 'amount': _money(m.group(2)),
+            amounts = [_money(x) for x in _MONEY.findall(m.group(2))]  # keep EVERY column
+            rows.append({'label': label, 'amount': amounts[0], 'amounts': amounts,
                          'total': label.lower().startswith('total'), 'net': label.lower().startswith('net')})
         elif s.lower() == 'income':
             rows.append({'label': s, 'amount': None, 'section': True})
@@ -84,11 +86,25 @@ def parse_detail(data):
         mh = _HEADER.match(s)
         if mh and not _MONEY.search(s):
             cur = mh.group(1).strip()
-    # month columns from the actual transaction date range (robust to formatting)
-    months = []
+    # month columns: prefer the printed "Report Period: m/d/y - m/d/y" (header text
+    # may be char-doubled, so also try the de-doubled line), widened to cover any
+    # transaction dates; fall back to the transaction date range alone.
+    period = None
+    for raw in t.splitlines()[:40]:
+        period = _PERIOD.search(raw) or _PERIOD.search(raw[::2])
+        if period:
+            break
+    starts, ends = [], []
+    if period:
+        g = period.groups()
+        starts.append(datetime.date(int(g[2]), int(g[0]), 1))
+        ends.append(datetime.date(int(g[5]), int(g[3]), 1))
     if seen_dates:
-        d = datetime.date(min(seen_dates).year, min(seen_dates).month, 1)
-        end = datetime.date(max(seen_dates).year, max(seen_dates).month, 1)
+        starts.append(datetime.date(min(seen_dates).year, min(seen_dates).month, 1))
+        ends.append(datetime.date(max(seen_dates).year, max(seen_dates).month, 1))
+    months = []
+    if starts:
+        d, end = min(starts), max(ends)
         while d <= end:
             months.append((f'{d.year}-{d.month:02d}', d.strftime('%b-%y')))
             d = (d.replace(day=28) + datetime.timedelta(days=7)).replace(day=1)
@@ -216,9 +232,9 @@ def build_workbook(summaries, detail, use_llm=True):
             for i, r in enumerate(spine):
                 if not _is_break(r) and _grp(r['label']) == grp:
                     pos = i + 1
-        if pos is None:                       # else before the first total (still an item)
-            pos = next((i for i, r in enumerate(spine) if _is_break(r)), len(spine))
-        spine.insert(pos, ex)
+        if pos is None:                       # nothing related in the spine (e.g. non-op
+            pos = len(spine)                  # items like mortgage/deposits) -> append;
+        spine.insert(pos, ex)                 # same-class followers cluster after it
 
     months = detail['months'] if detail else []
     nM = len(months)
@@ -239,37 +255,50 @@ def build_workbook(summaries, detail, use_llm=True):
         m = difflib.get_close_matches(name, list(tot_c), n=1, cutoff=0.86)
         return tot_c[m[0]] if m else None
 
+    # per-summary lookups (canon -> full row) + how many value columns each has
+    smaps = [{C(r['label']): r for r in sm['rows'] if r.get('amount') is not None} for sm in summaries]
+    ncols = [max((len(r.get('amounts') or [0]) for r in sm['rows'] if r.get('amount') is not None), default=1)
+             for sm in summaries]
+
     wb = openpyxl.Workbook()
     comb = wb.active; comb.title = 'Combined'
     stabs = []
-    for sm in summaries:
-        ws = wb.create_sheet(sm['label'][:31]); ws.append(['Line', sm['label']]); stabs.append((sm, ws))
+    for si, sm in enumerate(summaries):
+        ws = wb.create_sheet(sm['label'][:31])
+        ws.append(['Line', sm['label']] + [f'Col {j}' for j in range(2, ncols[si] + 1)])
+        stabs.append((sm, ws))
     dtab = None
     if detail:
         dtab = wb.create_sheet(detail['label'][:31]); dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
-
-    # per-summary lookups (canon -> (orig label, amount))
-    smaps = [{C(r['label']): (r['label'], r['amount']) for r in sm['rows'] if r.get('amount') is not None} for sm in summaries]
 
     def put(ws, row, col, val, red=False, bold=False):
         c = ws.cell(row, col, val)
         c.font = REDB if (red and bold) else RED if red else BOLD if bold else PLAIN
         return c
 
-    # column layout
-    CLS = 1
+    # column layout — between sections: blank | solid gray divider | blank
+    blanks, grays = set(), set()
     col = 2
+
+    def _sep():
+        nonlocal col
+        blanks.add(col); grays.add(col + 1); blanks.add(col + 2)
+        col += 3
+
+    CLS = 1
     sum_val_cols = []
     sum_blocks = []          # (summary index, Lcol, Vcol)
     for si, sm in enumerate(summaries):
-        sum_blocks.append((si, col, col + 1)); sum_val_cols.append(col + 1); col += 3  # label,val,spacer
+        sum_blocks.append((si, col, col + 1)); sum_val_cols.append(col + 1); col += 2
+        _sep()
     det_L = det_M0 = det_T = None
     if detail:
         det_L, det_M0 = col, col + 1
         det_T = det_M0 + nM
-        col = det_T + 2                       # + spacer
-    TOTAL = col; col += 2
-    RECON = col; col += 2
+        col = det_T + 1
+        _sep()
+    RECON = col; col += 1
+    _sep()
     # compact year-over-year block on the far right: values only, one column per
     # source, so big differences jump out without scanning the wide blocks
     CMP = []                 # (compact col, source value col on this sheet, header)
@@ -287,7 +316,6 @@ def build_workbook(summaries, detail, use_llm=True):
         for j, (_, lbl) in enumerate(months):
             comb.cell(1, det_M0 + j, lbl)
         comb.cell(1, det_T, 'YTD Total')
-    comb.cell(1, TOTAL, 'Total (all)')
     comb.cell(1, RECON, 'Recon')
     for cc, _srcc, hdr in CMP:
         comb.cell(1, cc, hdr)
@@ -300,11 +328,13 @@ def build_workbook(summaries, detail, use_llm=True):
         if is_tot:
             total_rows.append(row)
 
-        # write source tabs
+        # write source tabs (every parsed value column, not just the first)
         for si, (sm, ws) in enumerate(stabs):
             m = smaps[si].get(C(label))
-            ws.cell(row, 1, m[0] if m else label)
-            ws.cell(row, 2, m[1] if m else 0)
+            ws.cell(row, 1, m['label'] if m else label)
+            amts = (m.get('amounts') or [m['amount']]) if m else [0]
+            for j in range(ncols[si]):
+                ws.cell(row, 2 + j, amts[j] if j < len(amts) else None)
         cm = None if is_sec else (ytd_item(label) if detail else None)
         tm = ytd_total(label) if (detail and is_tot) else None
         if detail:
@@ -323,7 +353,8 @@ def build_workbook(summaries, detail, use_llm=True):
                 put(comb, row, det_L, label, bold=True)
             continue
         if not is_tot:
-            comb.cell(row, CLS, cmap.get(canon(label)) or classify(label))
+            c = comb.cell(row, CLS, cmap.get(canon(label)) or classify(label))
+            c.font = Font(size=9, color='6B7280')
 
         # summary blocks
         for si, Lc, Vc in sum_blocks:
@@ -338,9 +369,6 @@ def build_workbook(summaries, detail, use_llm=True):
             for j in range(nM):
                 put(comb, row, det_M0 + j, f"='{dl}'!{get_column_letter(2 + j)}{row}", red=not p26, bold=is_tot).number_format = CUR
             put(comb, row, det_T, f"='{dl}'!{get_column_letter(2 + nM)}{row}", red=not p26, bold=is_tot).number_format = CUR
-        # total across blocks
-        parts = [f"{get_column_letter(vc)}{row}" for vc in sum_val_cols] + ([f"{get_column_letter(det_T)}{row}"] if detail else [])
-        put(comb, row, TOTAL, '=' + '+'.join(parts), bold=is_tot).number_format = CUR
         if not is_tot and detail:
             comb.cell(row, RECON,
                       f'=IF(ABS({get_column_letter(det_T)}{row}-SUM({get_column_letter(det_M0)}{row}:{get_column_letter(det_M0+nM-1)}{row}))<0.01,"ok","CHECK")')
@@ -352,9 +380,10 @@ def build_workbook(summaries, detail, use_llm=True):
                 redf = not p26
             put(comb, row, cc, f"={get_column_letter(srcc)}{row}", red=redf, bold=is_tot).number_format = CUR
 
-    _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, detail is not None, total_rows)
-    for _, ws in stabs:
-        _format_src(ws, [2])
+    _format(comb, sum_blocks, det_L, det_M0, det_T, nM, RECON, detail is not None,
+            total_rows, blanks, grays)
+    for si, (_, ws) in enumerate(stabs):
+        _format_src(ws, list(range(2, 2 + ncols[si])))
     if detail:
         _format_src(dtab, list(range(2, 2 + nM + 1)))
 
@@ -372,23 +401,26 @@ def _format_src(ws, vcols):
         ws.column_dimensions[get_column_letter(c)].width = 11
 
 
-def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail, total_rows=()):
-    spacers = set()
-    for si, Lc, Vc in sum_blocks:
-        spacers.add(Vc + 1)
-    if has_detail:
-        spacers.add(det_T + 1)
-    spacers.add(TOTAL + 1)
-    spacers.add(RECON + 1)
+def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, RECON, has_detail,
+            total_rows=(), blanks=(), grays=()):
+    blanks, grays = set(blanks), set(grays)
+    skip = blanks | grays
+    GRAY = PatternFill('solid', fgColor='BFBFBF')
     for c in range(1, comb.max_column + 1):
         hc = comb.cell(1, c)
-        if c in spacers:
-            hc.fill = PatternFill(fill_type=None)
-            comb.column_dimensions[get_column_letter(c)].width = 2.5
+        if c in blanks:
+            comb.column_dimensions[get_column_letter(c)].width = 1.5
+        elif c in grays:
+            comb.column_dimensions[get_column_letter(c)].width = 2
         else:
             hc.font = HDR; hc.fill = HFILL; hc.alignment = Alignment(horizontal='center')
             comb.column_dimensions[get_column_letter(c)].width = 11
+    # solid gray divider bars, full height of the sheet
+    for c in grays:
+        for r in range(1, comb.max_row + 1):
+            comb.cell(r, c).fill = GRAY
     comb.freeze_panes = 'B2'
+    comb.row_dimensions[1].height = 22
     comb.column_dimensions['A'].width = 18
     for si, Lc, Vc in sum_blocks:
         comb.column_dimensions[get_column_letter(Lc)].width = 22
@@ -400,7 +432,7 @@ def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, TOTAL, RECON, has_detail
     maxc = comb.max_column
     for r in total_rows:
         for c in range(1, maxc + 1):
-            if c in spacers:
+            if c in skip:
                 continue
             cell = comb.cell(r, c)
             cell.fill = TOTAL_FILL
