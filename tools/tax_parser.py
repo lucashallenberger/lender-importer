@@ -75,6 +75,7 @@ def parse_pdf(pdf_path: Path) -> dict:
             "pers_property": None,
         },
         "property_tax_hardcoded": None,
+        "tax_year": None,
     }
 
     with pdfplumber.open(pdf_path) as pdf:
@@ -95,6 +96,14 @@ def parse_pdf(pdf_path: Path) -> dict:
         if m:
             data["apn"] = m.group(1)
             break
+
+    # ── Extract Tax (Fiscal) Year ────────────────────────────────────────
+    # e.g. "FISCAL YEAR JULY 1, 2024 ...", "2024-25", "2025-2026", "2024 ANNUAL"
+    m = (re.search(r'FISCAL\s+YEAR\s+JULY\s+1,?\s+(20[123]\d)', full_text, re.IGNORECASE)
+         or re.search(r'\b(20[123]\d)\s*[-–/]\s*(?:20)?\d{2}\b', full_text)
+         or re.search(r'\b(20[123]\d)\s+ANNUAL', full_text, re.IGNORECASE))
+    if m:
+        data["tax_year"] = int(m.group(1))
 
     # ── Sections: find bounds ─────────────────────────────────────────────
     section_keywords = {
@@ -611,6 +620,7 @@ def collect_edited(apn_in, mill_df, da_df, land, impr, pers, original):
             "pers_property": pers or None,
         },
         "property_tax_hardcoded": original.get("property_tax_hardcoded"),
+        "tax_year": original.get("tax_year"),
     }
 
 
@@ -695,6 +705,22 @@ def write_bill(ws, data, apn, c0=0, screenshot_path=None):
     return row
 
 
+def _bill_year(data, fname=""):
+    """Tax year for a bill: parsed from the PDF, else from the filename
+    (e.g. 'Property Tax Bill - 2025-2026.pdf' -> 2025, '14BrookTax22.pdf' -> 2022)."""
+    y = data.get("tax_year")
+    if y:
+        return int(y)
+    stem = Path(fname or "").stem
+    m = re.search(r'(20[123]\d)', stem)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d{2})\D*$', stem)
+    if m and 10 <= int(m.group(1)) <= 49:
+        return 2000 + int(m.group(1))
+    return None
+
+
 def _apn_fmt(apn):
     raw = re.sub(r"[^0-9]", "", apn or "")[:10]
     return f"{raw[:4]}-{raw[4:7]}-{raw[7:10]}" if len(raw) >= 10 else (raw or "APN?")
@@ -745,10 +771,19 @@ def _write_combined(ws, bills):
         c.font = normal; c.number_format = fmt
         return c
 
+    # ── Year labels (which bill is which) ────────────────────────────────
     row = 1
+    ws.cell(row, 1, "TAX YEAR").font = boldw; ws.cell(row, 1).fill = dark
+    for i, col in enumerate(bcols):
+        y = bills[i][3]
+        c = ws.cell(row, col, f"{y % 100:02d}" if y else "?")
+        c.font = boldw; c.fill = dark
+    c = ws.cell(row, ccol, "COMBINED"); c.font = boldw; c.fill = dark
+    row = 3
+
     # ── MILL RATE ─────────────────────────────────────────────────────────
     header(row, "MILL RATE"); row += 1
-    rate_lists = [[(a, r) for a, r in (d["mill_rates"] or [])] for d, _, _ in bills]
+    rate_lists = [[(a, r) for a, r in (d["mill_rates"] or [])] for d, _, _, _ in bills]
     order, luts = _union(rate_lists)
     rs = row
     for k, name in order:
@@ -770,7 +805,7 @@ def _write_combined(ws, bills):
 
     # ── DIRECT ASSESSMENTS (summed) ──────────────────────────────────────
     header(row, "DIRECT ASSESSMENTS"); row += 1
-    da_lists = [[(nm, amt) for nm, amt in (d["direct_assessments"] or [])] for d, _, _ in bills]
+    da_lists = [[(nm, amt) for nm, amt in (d["direct_assessments"] or [])] for d, _, _, _ in bills]
     order, luts = _union(da_lists)
     ds = row
     for k, name in order:
@@ -821,15 +856,41 @@ def _write_combined(ws, bills):
     for col in bcols + [ccol]:
         ws.column_dimensions[get_column_letter(col)].width = 15
 
+    # ── Bill images (one per bill, aligned under its column) ─────────────
+    from openpyxl.drawing.image import Image as XLImage
+    img_row = row + 3
+    ws.cell(img_row - 1, 1, "BILL IMAGES").font = boldw
+    ws.cell(img_row - 1, 1).fill = dark
+    for i, col in enumerate(bcols):
+        shot = bills[i][2]
+        y = bills[i][3]
+        lbl = ws.cell(img_row, col, f"20{y % 100:02d}" if y else "?")
+        lbl.font = bold
+        if shot and Path(shot).exists():
+            try:
+                img = XLImage(str(shot)); img.width = 300; img.height = 400
+                ws.add_image(img, f"{get_column_letter(col)}{img_row + 1}")
+            except Exception:
+                pass
+
 
 def build_combined_workbook(bills):
-    """bills: list of (data, apn, shot_path). Returns .xlsx bytes with one sheet per
-    bill (1, 2, …) plus a Combined sheet: bills in aligned columns and a COMBINED
-    column that adds them up (live SUM formulas)."""
+    """bills: list of (data, apn, shot_path, year). Returns .xlsx bytes with one
+    sheet per bill (named by tax year, oldest→newest) plus a Combined sheet: bills
+    in aligned columns and a COMBINED column that adds them up (live SUM formulas)."""
     from openpyxl import Workbook
+
+    # Order oldest → newest; bills without a year sink to the end (stable).
+    bills = sorted(bills, key=lambda b: (b[3] is None, b[3] or 0))
+
     wb = Workbook(); wb.remove(wb.active)
-    for i, (data, apn, shot) in enumerate(bills):
-        write_bill(wb.create_sheet(str(i + 1)), data, apn, c0=0, screenshot_path=shot)
+    used = set()
+    for i, (data, apn, shot, year) in enumerate(bills):
+        title = str(year) if year else f"Bill {i + 1}"
+        while title in used:            # guard against duplicate years
+            title += "*"
+        used.add(title)
+        write_bill(wb.create_sheet(title), data, apn, c0=0, screenshot_path=shot)
     _write_combined(wb.create_sheet("Combined"), bills)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
@@ -953,7 +1014,7 @@ def render():
                 for key, (edited, shot, fname, save_name) in current.items():
                     shot_bytes = Path(shot).read_bytes() if shot and Path(shot).exists() else None
                     save_record(save_name, edited["apn"], fname, edited, make_xlsx(edited, shot)[0], shot_bytes)
-                    bills.append((edited, edited["apn"] or "unknown", shot))
+                    bills.append((edited, edited["apn"] or "unknown", shot, _bill_year(edited, fname)))
                 st.session_state["batch_wb"] = build_combined_workbook(bills)
                 st.success(f"Built one workbook: {len(bills)} bill sheet(s) + a Combined sheet.")
 
