@@ -143,6 +143,15 @@ def _review_rent_roll(key, parsed):
 
 def _review_tax(key, parsed):
     d = parsed["data"]
+    rec = TX.tax_recon(d)
+    if rec and rec[2] <= 1.0:
+        st.caption(f"✅ Self-check: rate × value + assessments = ${rec[0]:,.2f} "
+                   f"vs printed ${rec[1]:,.2f}.")
+    elif rec:
+        st.warning(f"⚠️ Doesn't reconcile — computed ${rec[0]:,.2f} vs printed "
+                   f"${rec[1]:,.2f} ({rec[2]:.1f}% off). Check the values below.")
+    else:
+        st.warning("⚠️ No printed annual total to check against — verify the values below.")
     c1, c2, c3 = st.columns(3)
     apn = c1.text_input("APN", value=d.get("apn") or "", key=f"uwtx_apn_{key}")
     year = c2.number_input("Tax year", value=int(d.get("tax_year") or 0), step=1, key=f"uwtx_yr_{key}")

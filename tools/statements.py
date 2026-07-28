@@ -20,11 +20,14 @@ HDR = Font(bold=True, color='FFFFFF'); HFILL = PatternFill('solid', fgColor='4F4
 TOTAL_FILL = PatternFill('solid', fgColor='EEF0FF')   # very light indigo band
 TOTAL_TOP = Border(top=Side(style='thin', color='9CA3AF'))
 
-_ROW = re.compile(r'^(.*?)\s+((?:-?\$[\d,]+\.\d{2})(?:\s+-?\$[\d,]+\.\d{2})*)\s*$')
+# Amounts may or may not carry a "$": QuickBooks prints it only on bold/total
+# lines, so requiring it silently dropped every ordinary line item.
+_ROW = re.compile(r'^(.*?[A-Za-z].*?)\s+((?:-?\$?[\d,]+\.\d{2})(?:\s+-?\$?[\d,]+\.\d{2})*)\s*$')
+_AMT = re.compile(r'-?\$?[\d,]+\.\d{2}')
 # type may be multi-word: "Journal Entry", "Credit Memo", "Prepayment Application"
 _TXN = re.compile(r'^([A-Za-z][A-Za-z ]{0,24}?)\s+(\d{1,2}/\d{1,2}/\d{4})\s+.*?(-?\$[\d,]+\.\d{2})\s+(-?\$[\d,]+\.\d{2})\s*$')
 _HEADER = re.compile(r'^(.+?)\s*\((\d{3,6})\)\s*$')
-_TOTAL = re.compile(r'^Total\s+(.+?)\s+(-?\$[\d,]+\.\d{2})\s*$')
+_TOTAL = re.compile(r'^Total\s+(.+?)\s+(-?\$?[\d,]+\.\d{2})\s*$')
 _MONEY = re.compile(r'-?\$[\d,]+\.\d{2}')
 _PERIOD = re.compile(r'(\d{1,2})/(\d{1,2})/(\d{4})\s*-\s*(\d{1,2})/(\d{1,2})/(\d{4})')
 
@@ -49,19 +52,33 @@ def detect_kind(data):
 
 
 # ---------------------------------------------------------------- parsers
+_SECTION_WORDS = {'income', 'expenses', 'expense', 'other income', 'other expenses',
+                  'revenue', 'cost of goods sold', 'operating expenses'}
+
+
 def parse_summary(data):
+    lines = [l.strip() for l in _text(data).splitlines() if l.strip()]
+    # A parent/section line carries no amount of its own, but the report prints a
+    # "Total for <parent>" for it — use that to tell real sections apart from the
+    # page title and footer, which also have no amount.
+    parents = set()
+    for l in lines:
+        m = re.match(r'^Total\s+for\s+(.+?)(?:\s+-?\$?[\d,]+\.\d{2})?\s*$', l)
+        if m:
+            parents.add(canon(m.group(1)))
     rows = []
-    for raw in _text(data).splitlines():
-        s = raw.strip()
-        if not s:
-            continue
+    for s in lines:
         m = _ROW.match(s)
-        if m and m.group(1).strip():
+        if m:
             label = m.group(1).strip()
-            amounts = [_money(x) for x in _MONEY.findall(m.group(2))]  # keep EVERY column
+            amounts = [_money(x) for x in _AMT.findall(m.group(2))]   # keep EVERY column
+            if not amounts:
+                continue
+            low = label.lower()
             rows.append({'label': label, 'amount': amounts[0], 'amounts': amounts,
-                         'total': label.lower().startswith('total'), 'net': label.lower().startswith('net')})
-        elif s.lower() == 'income':
+                         'total': low.startswith('total') or low.startswith('gross'),
+                         'net': low.startswith('net')})
+        elif s.lower() in _SECTION_WORDS or canon(s) in parents:
             rows.append({'label': s, 'amount': None, 'section': True})
     return rows
 

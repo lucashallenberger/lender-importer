@@ -423,13 +423,36 @@ def extract_tax_bill(pdf_bytes: bytes) -> dict:
     }
 
 
-def _weak_tax(data: dict) -> bool:
-    """True when the regex parse looks thin — trigger the Claude fallback."""
+def tax_recon(data: dict):
+    """(computed, printed, pct_off) for the bill, or None when it can't be checked.
+    computed = total mill rate x taxable value + direct assessments, which is how
+    the bill itself is built — so a mismatch means something parsed wrong."""
+    hc = data.get("property_tax_hardcoded")
+    if not hc:
+        return None
     tv = data.get("taxable_value") or {}
-    return (len(data.get("mill_rates") or []) < 2
+    tv_total = sum(v or 0 for v in tv.values())
+    rate = sum(r for _, r in (data.get("mill_rates") or [])) / 100
+    da = sum(a for _, a in (data.get("direct_assessments") or []))
+    if tv_total <= 0 or rate <= 0:
+        return None
+    calc = rate * tv_total + da
+    return calc, hc, abs(calc - hc) / hc * 100
+
+
+def _weak_tax(data: dict) -> bool:
+    """True when the regex parse can't be trusted — trigger the Claude fallback.
+    Beyond missing fields, this re-derives the bill's own arithmetic: if
+    rate x value + assessments doesn't land on the printed total, something was
+    misread even when every field looks present."""
+    tv = data.get("taxable_value") or {}
+    if (len(data.get("mill_rates") or []) < 2
             or not data.get("direct_assessments")
             or tv.get("land") is None
-            or data.get("property_tax_hardcoded") is None)
+            or data.get("property_tax_hardcoded") is None):
+        return True
+    rec = tax_recon(data)
+    return rec is None or rec[2] > 1.0        # >1% off the printed total
 
 
 def _merge_tax(base: dict, ai: dict) -> dict:
@@ -1094,6 +1117,17 @@ def render():
                             except Exception as e:  # noqa: BLE001
                                 st.warning(f"AI read failed for {f.name}: {e}")
                         shot = pdf_to_screenshot(pdf_path)
+                    rec = tax_recon(data)
+                    if rec and rec[2] <= 1.0:
+                        st.caption(f"✅ {f.name}: checks out — rate × value + assessments = "
+                                   f"${rec[0]:,.2f} vs printed ${rec[1]:,.2f}.")
+                    elif rec:
+                        st.warning(f"⚠️ {f.name}: the numbers don't reconcile — computed "
+                                   f"${rec[0]:,.2f} vs printed ${rec[1]:,.2f} ({rec[2]:.1f}% off). "
+                                   "Check the mill rates and taxable values against the preview.")
+                    elif not data.get("property_tax_hardcoded"):
+                        st.warning(f"⚠️ {f.name}: no annual total found on the bill, so it "
+                                   "can't be self-checked — verify the values against the preview.")
                     if used_ai:
                         st.info(f"🤖 {f.name}: read/verified by Claude — spot-check the values against the preview.")
                     elif data.get("scanned_no_text"):
