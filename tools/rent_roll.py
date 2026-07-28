@@ -440,12 +440,15 @@ def _build_worksheet(ws, data, refs):
 def build_into(wb, data: dict, name="W - RR", src_name="S - RR", prop_info=None) -> dict:
     """Write the Worksheet + Source pair (and an optional Property Info cover
     sheet) into an existing workbook. Returns the Source refs for linking."""
+    from tools import xl as XL
+    if not (data or {}).get("units"):
+        raise ValueError("rent roll has no units to write")
     if prop_info:
         from tools import prop_info as PI
-        PI.build_sheet(wb.create_sheet("Property Info"), prop_info)
-    ws = wb.create_sheet(name)
-    src = wb.create_sheet(src_name)
-    refs = _build_source(src, data)
+        PI.build_sheet(XL.new_sheet(wb, "Property Info")[0], prop_info)
+    ws = XL.new_sheet(wb, name)[0]
+    src = XL.new_sheet(wb, src_name)[0]
+    refs = _build_source(src, data)      # refs carry src.title, so links stay correct
     _build_worksheet(ws, data, refs)
     return refs
 

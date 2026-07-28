@@ -13,6 +13,8 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+from tools import xl as XL   # safe/unique sheet titles
+
 CUR = '#,##0.00'
 RED = Font(color='C00000'); REDB = Font(color='C00000', bold=True)
 BOLD = Font(bold=True); PLAIN = Font()
@@ -280,17 +282,19 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
     ncols = [max((len(r.get('amounts') or [0]) for r in sm['rows'] if r.get('amount') is not None), default=1)
              for sm in summaries]
 
-    comb = wb.create_sheet(combined_title)
-    stab_names = [(src_prefix + sm['label'])[:31] for sm in summaries]
-    dtab_name = (src_prefix + detail['label'])[:31] if detail else None
-    stabs = []
+    # Labels come from filenames, so titles can be illegal ("P&L 2024/25"),
+    # too long, or duplicated — take the title new_sheet actually used so the
+    # cross-sheet formulas below can never point at a renamed sheet.
+    comb, combined_title = XL.new_sheet(wb, combined_title)
+    stab_names, stabs = [], []
     for si, sm in enumerate(summaries):
-        ws = wb.create_sheet(stab_names[si])
+        ws, title = XL.new_sheet(wb, src_prefix + str(sm['label']))
         ws.append(['Line', sm['label']] + [f'Col {j}' for j in range(2, ncols[si] + 1)])
-        stabs.append((sm, ws))
-    dtab = None
+        stab_names.append(title); stabs.append((sm, ws))
+    dtab = dtab_name = None
     if detail:
-        dtab = wb.create_sheet(dtab_name); dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
+        dtab, dtab_name = XL.new_sheet(wb, src_prefix + str(detail['label']))
+        dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
 
     def put(ws, row, col, val, red=False, bold=False):
         c = ws.cell(row, col, val)

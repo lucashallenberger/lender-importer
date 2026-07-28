@@ -16,6 +16,7 @@ from pathlib import Path
 import streamlit as st
 
 from tools import hist_llm   # shared Claude plumbing (api_key/_client/MODEL/_json_response)
+from tools import xl as XL   # safe/unique sheet titles
 
 # All intermediate files (screenshot, xlsx) go to a per-session temp folder.
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "apn_tax_tool"
@@ -295,20 +296,24 @@ def parse_pdf(pdf_path: Path) -> dict:
 
 
 def pdf_to_screenshot(pdf_path: Path) -> Path:
-    """Render first page of PDF to PNG."""
-    png_path = OUTPUT_DIR / (pdf_path.stem + "_screenshot.png")
+    """Render the first page of a PDF to a JPEG for embedding.
+
+    Each bill's image is embedded twice (its own sheet + the combined sheet), so
+    size matters: at 2x-zoom PNG a 12-bill workbook came to 13 MB, which is slow
+    to build and download and risks the memory ceiling on Streamlit Cloud. 1.5x
+    JPEG stays legible at roughly a fifth of the bytes.
+    """
+    jpg_path = OUTPUT_DIR / (pdf_path.stem + "_screenshot.jpg")
 
     # Try pymupdf (fitz) - most reliable cross-platform option
     try:
         import fitz  # pymupdf
         doc = fitz.open(str(pdf_path))
         page = doc[0]
-        mat = fitz.Matrix(2.0, 2.0)  # 2x zoom = ~150dpi
-        pix = page.get_pixmap(matrix=mat)
-        pix.save(str(png_path))
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))   # ~110 dpi
+        pix.save(str(jpg_path), jpg_quality=75)
         doc.close()
-        print(f"[4a] Screenshot rendered via pymupdf")
-        return png_path
+        return jpg_path
     except ImportError:
         pass
     except Exception as e:
@@ -317,14 +322,13 @@ def pdf_to_screenshot(pdf_path: Path) -> Path:
     # Try pdf2image
     try:
         from pdf2image import convert_from_path
-        pages = convert_from_path(str(pdf_path), dpi=150, first_page=1, last_page=1)
-        pages[0].save(str(png_path))
-        print(f"[4a] Screenshot rendered via pdf2image")
-        return png_path
+        pages = convert_from_path(str(pdf_path), dpi=110, first_page=1, last_page=1)
+        pages[0].convert("RGB").save(str(jpg_path), quality=75)
+        return jpg_path
     except Exception as e:
         print(f"[WARN] pdf2image failed: {e}")
 
-    print(f"[WARN] Could not render PDF screenshot - no image will be embedded")
+    print("[WARN] Could not render PDF screenshot - no image will be embedded")
     return None
 
 
@@ -490,8 +494,7 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
       Screenshot embedded at right (col E)
     """
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Font, PatternFill
     from openpyxl.drawing.image import Image as XLImage
 
     wb = Workbook()
@@ -501,8 +504,6 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
     bold        = Font(bold=True, name="Arial")
     bold_white  = Font(bold=True, name="Arial", color="FFFFFF")
     normal      = Font(name="Arial")
-    thin        = Side(style="thin")
-    border      = Border(top=thin, bottom=thin)
     dark_grey   = PatternFill(start_color="404040", end_color="404040", fill_type="solid")
 
     header_rows = set()  # track which rows get dark grey treatment
@@ -598,7 +599,6 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
     if land_val is not None:
         cell(row, 2, land_val, fmt='#,##0')
     row += 1
-    impr_row = row
     cell(row, 1, "Improvements")
     if impr_val is not None:
         cell(row, 2, impr_val, fmt='#,##0')
@@ -641,9 +641,8 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
             img.width  = 480
             img.height = 640
             ws.add_image(img, "D1")
-            print("[9] Screenshot embedded in Excel")
-        except Exception as e:
-            print(f"[WARN] Could not embed screenshot: {e}")
+        except Exception:
+            pass   # image is a nicety; never fail the build over it
 
     safe_apn = re.sub(r'[^0-9A-Za-z]', '', apn)
     xlsx_path = OUTPUT_DIR / f"tax_bill_{safe_apn}.xlsx"
@@ -651,19 +650,17 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
     for attempt in range(3):
         try:
             wb.save(str(xlsx_path))
-            print(f"[10] Excel saved: {xlsx_path}")
             return xlsx_path
         except PermissionError:
             if attempt < 2:
                 import time as _t
                 alt = xlsx_path.with_stem(xlsx_path.stem + f"_v{attempt+2}")
-                print(f"[WARN] File locked, trying: {alt.name}")
                 xlsx_path = alt
                 _t.sleep(1)
             else:
                 raise RuntimeError(
-                    f"Cannot save Excel — file is open or locked.\n"
-                    f"Please close any open Excel files in your output folder and try again."
+                    "Cannot save Excel — file is open or locked.\n"
+                    "Please close any open Excel files in your output folder and try again."
                 )
 
 
@@ -675,7 +672,6 @@ def build_excel(data: dict, screenshot_path: Path | None, apn: str) -> Path:
 import json
 import sqlite3
 import datetime
-import zipfile
 import pandas as pd
 
 DB_PATH = Path(__file__).parent / "data" / "tax_history.db"
@@ -905,7 +901,6 @@ def _write_combined(ws, bills):
     bcols = list(range(2, 2 + n))          # one value column per bill
     ccol = 2 + n                           # COMBINED column
     B0, BL = get_column_letter(bcols[0]), get_column_letter(bcols[-1])
-    CL = get_column_letter(ccol)
 
     def header(row, title, with_apns=True):
         ws.cell(row, 1, title).font = boldw
@@ -1028,20 +1023,21 @@ def build_tax_into(wb, bills, prefix="S - Tax ", combined_name="W - RE Taxes"):
     """Write per-bill sheets (year-named, oldest→newest) + a combined sheet into an
     existing workbook. Returns metadata for the NEWEST year-bearing bill so other
     sheets can link its annual tax: {'sheet', 'hardcoded_cell', 'performula_cell'}."""
+    if not bills:
+        raise ValueError("no tax bills to write")
     bills = sorted(bills, key=lambda b: (b[3] is None, b[3] or 0))
-    used, newest = set(), None
+    newest = None
     for i, (data, apn, shot, year) in enumerate(bills):
-        title = f"{prefix}{year}" if year else f"{prefix}Bill {i + 1}"
-        while title in used:            # guard against duplicate years
-            title += "*"
-        used.add(title)
-        last = write_bill(wb.create_sheet(title), data, apn, c0=0, screenshot_path=shot)
+        # several bills can share a year (same property, or duplicate uploads):
+        # new_sheet dedupes legally instead of building an illegal "2025*"
+        ws, title = XL.new_sheet(wb, f"{prefix}{year}" if year else f"{prefix}Bill {i + 1}")
+        last = write_bill(ws, data, apn, c0=0, screenshot_path=shot)
         if year is not None or newest is None:
             newest = {"sheet": title,
                       "hardcoded_cell": f"'{title}'!B{last}",
                       "performula_cell": f"'{title}'!B{last - 1}"}
     if len(bills) > 1:
-        _write_combined(wb.create_sheet(combined_name), bills)
+        _write_combined(XL.new_sheet(wb, combined_name)[0], bills)
     return newest
 
 
@@ -1053,9 +1049,7 @@ def build_combined_workbook(bills):
     wb = Workbook(); wb.remove(wb.active)
     build_tax_into(wb, bills)
     if len(bills) == 1:                 # standalone tool always shows the combined tab
-        _write_combined(wb["W - RE Taxes"] if "W - RE Taxes" in wb.sheetnames
-                        else wb.create_sheet("W - RE Taxes"),
-                        sorted(bills, key=lambda b: (b[3] is None, b[3] or 0)))
+        _write_combined(XL.new_sheet(wb, "W - RE Taxes")[0], bills)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 

@@ -92,12 +92,20 @@ def _parse_doc(kind: str, fname: str, pdf_bytes: bytes, ai_on: bool):
         rows = ST.parse_summary(pdf_bytes)
         n_items = sum(1 for r in rows if r.get("amount") is not None
                       and not r.get("total") and not r.get("net"))
-        if n_items < 3 and ai_on:
+        if n_items < 3:
+            if not ai_on:
+                raise RuntimeError(
+                    "this statement has no readable text layer (it looks scanned) and "
+                    "AI is off — set ANTHROPIC_API_KEY so Claude can read it")
             rows = hist_llm.extract_statement(pdf_bytes)
         return {"rows": rows}
     if kind == "detail":
         d = ST.parse_detail(pdf_bytes)
-        if not d["cats"] and ai_on:
+        if not d["cats"]:
+            if not ai_on:
+                raise RuntimeError(
+                    "no transactions could be read from this statement and AI is off — "
+                    "set ANTHROPIC_API_KEY so Claude can read it")
             return {"rows": hist_llm.extract_statement(pdf_bytes), "as_summary": True}
         return d
     return None
@@ -114,10 +122,11 @@ def _stmt_label(fname):
 # ── workbook assembly (no Pro Forma — that stays manual) ────────────────────
 def build_underwriting(prop_info, rr_data, tax_bills, summaries, detail, use_llm=True):
     from openpyxl import Workbook
+    from tools import xl as XL
     wb = Workbook(); wb.remove(wb.active)
     if prop_info and any(v is not None for v in prop_info.values()):
-        PI.build_sheet(wb.create_sheet("Property Info"), prop_info)
-    if rr_data:
+        PI.build_sheet(XL.new_sheet(wb, "Property Info")[0], prop_info)
+    if rr_data and rr_data.get("units"):
         RR.build_into(wb, rr_data, name="W - RR", src_name="S - RR")
     if summaries or detail:
         ST.build_into(wb, summaries, detail, use_llm=use_llm, combined_title="W - Historicals")
