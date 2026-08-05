@@ -102,17 +102,22 @@ file never stored a result for — ignore it and use the underlying values inste
 Read the rest exactly as you would read the printed report."""
 
 
-def content_blocks(data, prompt):
+def content_blocks(data, prompt, transform=None):
     """Message content for a source document. PDFs go through as a document
     block; workbooks and CSVs are rendered to text first (the API can't read an
-    .xlsx), so every extractor accepts either without caring which it got."""
+    .xlsx), so every extractor accepts either without caring which it got.
+    `transform` gets a crack at the rendering — a caller that knows some of the
+    sheet is noise can drop it before it's paid for."""
     from tools import tabular
     if tabular.kind(data) == "pdf":
         return [{"type": "document",
                  "source": {"type": "base64", "media_type": "application/pdf",
                             "data": base64.standard_b64encode(bytes(data)).decode()}},
                 {"type": "text", "text": prompt}]
-    return [{"type": "text", "text": f"{_SHEET_INTRO}\n\n{tabular.to_text(data)}"},
+    rendered = tabular.to_text(data)
+    if transform:
+        rendered = transform(rendered)
+    return [{"type": "text", "text": f"{_SHEET_INTRO}\n\n{rendered}"},
             {"type": "text", "text": prompt}]
 
 

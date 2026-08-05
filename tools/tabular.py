@@ -248,3 +248,49 @@ def _csv_text(data) -> str:
             break
         rows.append([re.sub(r"\s+", " ", (c or "")).strip() for c in r])
     return _join([_render_sheet("Sheet1", rows)])
+
+# A development budget spreads its cost lines across a monthly draw schedule —
+# sixty to eighty columns of numbers that say nothing about what a cost IS.
+# Sending them to Claude costs more than the rest of the document put together.
+_PERIOD_HEAD = re.compile(
+    r"^\s*(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"          # 09/01/2026
+    r"|\d{4}-\d{2}"                                    # 2026-09
+    r"|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s-]*\d{2,4}"
+    r"|\d{1,3}(?:\.\d+)?%?)\s*$", re.I)
+
+
+def drop_period_columns(text: str, keep_first: int = 20, min_run: int = 8) -> str:
+    """Drop a long run of period columns from a rendered sheet. Only a run that
+    is unbroken and sits to the right of the labelled columns goes — a table that
+    is genuinely wide keeps everything."""
+    rows = [line.split(" | ") for line in text.split("\n")]
+    width = max((len(r) for r in rows), default=0)
+    if width <= keep_first + min_run:
+        return text
+    header = max(rows, key=lambda r: sum(1 for c in r if c.strip()), default=[])
+    run, best = [], []
+    for i in range(keep_first, width):
+        head = header[i].strip() if i < len(header) else ""
+        col = [r[i].strip() for r in rows if i < len(r)]
+        numeric = sum(1 for v in col if v and re.fullmatch(r"-?[\d,.$()%]+", v))
+        filled = sum(1 for v in col if v)
+        if _PERIOD_HEAD.match(head) or (filled and numeric / filled > 0.9):
+            run.append(i)
+        else:
+            if len(run) > len(best):
+                best = run
+            run = []
+    if len(run) > len(best):
+        best = run
+    if len(best) < min_run:
+        return text
+    drop = set(best)
+    out = []
+    for r in rows:
+        kept = [c for i, c in enumerate(r) if i not in drop]
+        while kept and not kept[-1].strip():
+            kept.pop()
+        out.append(" | ".join(kept))
+    note = (f"\n\n[{len(drop)} period/schedule columns were left out of this "
+            f"rendering — they hold a month-by-month spread of the same costs.]")
+    return "\n".join(out) + note

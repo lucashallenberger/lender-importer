@@ -23,7 +23,7 @@ st.set_page_config(page_title="QCP Tools", page_icon="🏢", layout="wide",
                    initial_sidebar_state="expanded")
 
 from tools import (tax_parser, lender_importer, historicals, rent_roll,  # noqa: E402
-                   underwrite, public_uw)
+                   underwrite, public_uw, cost_budget)
 
 # id -> (sidebar label, render, caption). The id is what gets saved, so labels
 # can be reworded without stranding somebody's saved order.
@@ -34,6 +34,8 @@ TOOLS = {
                     "Deal documents → one workbook"),
     "public_uw": ("📤   Public UW", public_uw.render,
                   "Finished workbook → public tabs"),
+    "cost_budget": ("🧱   Cost Budget", cost_budget.render,
+                    "Sponsor cost basis → underwriting sheet"),
     "rent_roll": ("🏘️   Rent Roll Parser", rent_roll.render,
                   "Rent roll → sourced worksheet"),
     "tax_bill": ("🏠   Tax Bill Parser", tax_parser.render,
