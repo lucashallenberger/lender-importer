@@ -43,11 +43,19 @@ def _doubled(s):
 
 
 def _text(data):
+    """Plain text of a source document: PDF text layer, or the sheet-by-sheet
+    rendering for workbooks/CSVs (so classification greps both the same way)."""
+    from tools import tabular
+    if tabular.is_spreadsheet(data):
+        return tabular.to_text(data)
     with pdfplumber.open(io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data) as pdf:
         return '\n'.join((p.extract_text() or '') for p in pdf.pages)
 
 
 def detect_kind(data):
+    from tools import tabular
+    if tabular.is_spreadsheet(data):
+        return 'summary'      # spreadsheet statements go to the LLM as summaries
     t = _text(data)
     return 'detail' if ('Cash Flow Detail' in t or _doubled('CCaasshh') and 'DDeettaaiill' in t or
                         sum(bool(_TXN.match(l.strip())) for l in t.splitlines()) > 15) else 'summary'
@@ -128,6 +136,104 @@ def parse_detail(data):
             months.append((f'{d.year}-{d.month:02d}', d.strftime('%b-%y')))
             d = (d.replace(day=28) + datetime.timedelta(days=7)).replace(day=1)
     return {'cats': cats, 'totals': totals, 'months': months}
+
+
+# -------------------------------------------- period columns -> detail / summary
+_MONTH_WORDS = {m: i for i, m in enumerate(
+    ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'], 1)}
+_TOTALISH = re.compile(r'\b(total|ytd|year[\s-]?to[\s-]?date|annual|sum)\b', re.I)
+
+
+def parse_period(s):
+    """A column header -> 'YYYY-MM', or None if it isn't a month.
+    Handles 'Jan-25', 'January 2025', '01/2025', '2025-01', 'Jan 2025'."""
+    s = str(s or '').strip()
+    if not s:
+        return None
+    m = re.search(r'([A-Za-z]{3,9})[\s\-./]*(\d{2,4})', s)
+    if m and m.group(1)[:3].lower() in _MONTH_WORDS:
+        mo, yr = _MONTH_WORDS[m.group(1)[:3].lower()], int(m.group(2))
+        return f'{2000 + yr if yr < 100 else yr}-{mo:02d}'
+    m = re.fullmatch(r'\s*(\d{1,2})[/\-](\d{2,4})\s*', s)      # 01/2025
+    if m and 1 <= int(m.group(1)) <= 12:
+        yr = int(m.group(2))
+        return f'{2000 + yr if yr < 100 else yr}-{int(m.group(1)):02d}'
+    m = re.fullmatch(r'\s*(\d{4})[-/](\d{1,2})\s*', s)         # 2025-01
+    if m and 1 <= int(m.group(2)) <= 12:
+        return f'{m.group(1)}-{int(m.group(2)):02d}'
+    return None
+
+
+def _month_columns(periods):
+    """[(column index, 'YYYY-MM')] for the month columns, chronological, deduped."""
+    seen, keep = set(), []
+    for i, p in enumerate(periods or []):
+        k = parse_period(p)
+        if k and k not in seen:
+            seen.add(k)
+            keep.append((i, k))
+    keep.sort(key=lambda t: t[1])
+    return keep
+
+
+def _amt(a):
+    return float(a) if isinstance(a, (int, float)) and not isinstance(a, bool) else None
+
+
+def detail_from_periods(periods, rows, min_months=3):
+    """A monthly grid (T-12) -> the same {'cats','totals','months'} shape parse_detail
+    produces for QuickBooks detail PDFs, so it flows into the existing month-column
+    builder. Returns None when the statement isn't monthly."""
+    cols = _month_columns(periods)
+    if len(cols) < min_months:
+        return None
+    months = [(k, datetime.date(int(k[:4]), int(k[5:]), 1).strftime('%b-%y')) for _, k in cols]
+    cats, totals = {}, {}
+    for r in rows or []:
+        label = str(r.get('label') or '').strip()
+        if not label:
+            continue
+        amounts = r.get('amounts') or []
+        vals = {k: _amt(amounts[i]) for i, k in cols
+                if i < len(amounts) and _amt(amounts[i]) is not None}
+        if r.get('kind') in ('total', 'net'):
+            if vals:      # a blank printed total is missing, not zero
+                # parse_detail keys totals by the category name, not "Total <name>"
+                totals[re.sub(r'^total\s+', '', label, flags=re.I).strip()] = \
+                    round(sum(vals.values()), 2)
+        elif r.get('kind') == 'item' and vals:
+            cats[label] = vals
+    return {'cats': cats, 'totals': totals, 'months': months} if cats else None
+
+
+def summary_from_periods(periods, rows):
+    """Flatten a multi-column statement to parse_summary's row shape. The headline
+    amount is the printed Total/YTD column when there is one, else the sum of the
+    month columns, else the first value — never January standing in for the year."""
+    cols = _month_columns(periods)
+    tot_i = next((i for i, p in enumerate(periods or [])
+                  if _TOTALISH.search(str(p or '')) and not parse_period(p)), None)
+    out = []
+    for r in rows or []:
+        label = str(r.get('label') or '').strip()
+        if not label:
+            continue
+        amounts = r.get('amounts') or []
+        vals = [_amt(a) for a in amounts]
+        kept = [v for v in vals if v is not None]
+        if r.get('kind') == 'section':
+            out.append({'label': label, 'amount': None, 'section': True})
+            continue
+        if tot_i is not None and tot_i < len(vals) and vals[tot_i] is not None:
+            amount = vals[tot_i]
+        elif len(cols) >= 3:
+            amount = round(sum(vals[i] for i, _ in cols
+                               if i < len(vals) and vals[i] is not None), 2)
+        else:
+            amount = kept[0] if kept else None
+        out.append({'label': label, 'amount': amount, 'amounts': kept or None,
+                    'total': r.get('kind') == 'total', 'net': r.get('kind') == 'net'})
+    return out
 
 
 # ---------------------------------------------------------------- normalize + classify
@@ -322,8 +428,10 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
         det_T = det_M0 + nM
         col = det_T + 1
         _sep()
-    RECON = col; col += 1
-    _sep()
+    RECON = None
+    if detail:                       # reconciles the detail's months against its YTD
+        RECON = col; col += 1
+        _sep()
     # compact year-over-year block on the far right: values only, one column per
     # source, so big differences jump out without scanning the wide blocks
     CMP = []                 # (compact col, source value col on this sheet, header)
@@ -341,7 +449,8 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
         for j, (_, lbl) in enumerate(months):
             comb.cell(1, det_M0 + j, lbl)
         comb.cell(1, det_T, 'YTD Total')
-    comb.cell(1, RECON, 'Recon')
+    if RECON:
+        comb.cell(1, RECON, 'Recon')
     for cc, _srcc, hdr in CMP:
         comb.cell(1, cc, hdr)
 
@@ -357,7 +466,9 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
         for si, (sm, ws) in enumerate(stabs):
             m = smaps[si].get(C(label))
             ws.cell(row, 1, m['label'] if m else label)
-            amts = (m.get('amounts') or [m['amount']]) if m else [0]
+            # a section header has no amount of its own — blank, not 0.00 (a
+            # missing *line item*, though, is a real 0 for the combined tab)
+            amts = (m.get('amounts') or [m['amount']]) if m else ([None] if is_sec else [0])
             for j in range(ncols[si]):
                 ws.cell(row, 2 + j, amts[j] if j < len(amts) else None)
         cm = None if is_sec else (ytd_item(label) if detail else None)

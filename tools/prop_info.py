@@ -32,6 +32,68 @@ BLDG_FIELDS = [
 ]
 ALL_KEYS = [k for _, k in PROP_FIELDS] + ["address_line2"] + [k for _, k in BLDG_FIELDS]
 
+
+# ── building the info dict from whatever we have ────────────────────────────
+def blank() -> dict:
+    return dict.fromkeys(ALL_KEYS + ["verified_address"])
+
+
+def _scalar(v):
+    """The research reply is free-form JSON, so a field can come back as a list
+    ("parking": ["Surface","Covered"]) or a nested object. openpyxl refuses to
+    write those — flatten to something a cell can hold."""
+    if v is None or isinstance(v, (str, int, float)) and not isinstance(v, bool):
+        return v
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, (list, tuple, set)):
+        return ", ".join(str(x) for x in v if x not in (None, "")) or None
+    if isinstance(v, dict):
+        return ", ".join(f"{k}: {x}" for k, x in v.items() if x not in (None, "")) or None
+    return str(v)
+
+
+def has_any(info) -> bool:
+    """True when there's something worth putting on a cover sheet."""
+    return bool(info) and any(info.get(k) not in (None, "") for k in ALL_KEYS)
+
+
+def merge(*layers) -> dict:
+    """Later layers win, but only where they actually carry a value — so a web
+    lookup fills the gaps in what the documents already told us instead of
+    blanking them out when the lookup comes back thin."""
+    out = blank()
+    for layer in layers:
+        for k, v in (layer or {}).items():
+            if k in out and v not in (None, ""):
+                out[k] = v
+    return out
+
+
+def from_rent_roll(rr: dict) -> dict:
+    """What the rent roll itself already told us about the property. This is
+    what guarantees a Property Info tab even when the web lookup isn't run."""
+    out = blank()
+    if not rr:
+        return out
+    name = str(rr.get("property_name") or "").strip()
+    if name:
+        out["property_name"] = name
+        if re.match(r"\s*\d", name):        # "2821 N Sierra St" — already an address
+            out["address_line1"] = name
+    csz = str(rr.get("city_state_zip") or "").strip()
+    if csz:
+        out["address_line2"] = csz
+    if rr.get("apn"):
+        out["apn"] = rr["apn"]
+    units = rr.get("units") or []
+    if units:
+        out["num_units"] = len(units)
+        sf = sum(float(u["unit_sf"]) for u in units if u.get("unit_sf"))
+        if sf:
+            out["leasable_sf"] = round(sf)
+    return out
+
 _PROMPT = """Research this property using web search and report what you find.
 
 APN (Assessor's Parcel Number): {apn}
@@ -94,9 +156,9 @@ def fetch(apn: str, hint: str = "", zip_code: str = "") -> dict:
 def _fetch_once(apn: str, hint: str, zip_code: str) -> dict:
     resp = hist_llm._client().messages.create(
         model=hist_llm.MODEL,
-        max_tokens=8000,
+        max_tokens=12000,
         thinking={"type": "adaptive"},
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}],
         messages=[{"role": "user", "content": _PROMPT.format(
             apn=apn.strip() or "unknown — determine it from the full address below "
                                "(then treat that parcel as the subject)",
@@ -104,10 +166,40 @@ def _fetch_once(apn: str, hint: str, zip_code: str) -> dict:
             hint=f"Known name/address hint: {hint}" if hint.strip() else "")}],
     )
     text = "".join(b.text for b in resp.content if b.type == "text")
-    info = _last_json(text)
+    info = {k: _scalar(v) for k, v in _last_json(text).items()}
+    if not info and text.strip():
+        # The research happened but the closing JSON never landed (long web-search
+        # turns get truncated, or the model answered in prose). Don't throw the
+        # findings away — have it restate them as JSON, no searching this time.
+        info = _restate(text)
     out = {k: info.get(k) for k in ALL_KEYS}
     out["verified_address"] = info.get("verified_address")
     return out
+
+
+_RESTATE_SCHEMA = {
+    "type": "object",
+    "properties": {k: {"anyOf": [{"type": "string"}, {"type": "number"}, {"type": "null"}]}
+                   for k in ALL_KEYS + ["verified_address"]},
+    "required": ALL_KEYS + ["verified_address"],
+    "additionalProperties": False,
+}
+
+
+def _restate(text: str) -> dict:
+    """Convert a prose/partial research write-up into the info dict."""
+    try:
+        resp = hist_llm._client().messages.create(
+            model=hist_llm.MODEL, max_tokens=4000,
+            messages=[{"role": "user", "content":
+                       "Below is a research write-up about one property. Report the facts it "
+                       "states, as JSON. Use null for anything it does not state — do not "
+                       "guess or add anything of your own.\n\n" + text[-12000:]}],
+            output_config={"format": {"type": "json_schema", "schema": _RESTATE_SCHEMA}},
+        )
+        return hist_llm._json_response(resp) or {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _balanced_json(text: str, want: set, min_hits: int) -> dict:
@@ -163,7 +255,7 @@ def candidates(address: str, zip_code: str = "") -> list:
         model=hist_llm.MODEL,
         max_tokens=6000,
         thinking={"type": "adaptive"},
-        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+        tools=[{"type": "web_search_20260209", "name": "web_search", "max_uses": 6}],
         messages=[{"role": "user", "content": _CAND_PROMPT.format(
             address=address,
             zip_line=f"ZIP code (if known): {zip_code.strip()}\n" if zip_code.strip() else "",
@@ -197,6 +289,7 @@ def build_sheet(ws, info: dict):
             cell = ws.cell(row, cc)
             cell.fill = gold; cell.border = box
         c = ws.cell(row, vc)
+        val = _scalar(val)
         if val is not None and val != "":
             c.value = val
             if fmt and isinstance(val, (int, float)):

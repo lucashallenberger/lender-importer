@@ -1019,24 +1019,49 @@ def _write_combined(ws, bills):
                 pass
 
 
-def build_tax_into(wb, bills, prefix="S - Tax ", combined_name="W - RE Taxes"):
+_COUNTY_OF = re.compile(r"COUNTY\s+OF\s+([A-Z][A-Za-z .'\-]{2,24})")
+_X_COUNTY = re.compile(r"\b([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){0,2})\s+COUNTY\b")
+_COUNTY_STOP = {"AGENCIES", "IN", "THE", "OF", "AND", "FOR", "ALL", "TAX", "THIS", "BY"}
+
+
+def county_from_text(text: str):
+    """The county off the printed bill — one more cover-sheet field with no web
+    lookup. 'COUNTY OF LOS ANGELES' / '...AGENCIES IN LOS ANGELES COUNTY' -> 'Los Angeles'."""
+    m = _COUNTY_OF.search(text or "") or _X_COUNTY.search(text or "")
+    if not m:
+        return None
+    words = [w for w in m.group(1).split() if w.upper() not in _COUNTY_STOP]
+    return " ".join(w.capitalize() for w in words[-3:]) or None
+
+
+def build_tax_into(wb, bills, prefix="S - Tax ", combined_name="W - RE Taxes",
+                   always_combined=False):
     """Write per-bill sheets (year-named, oldest→newest) + a combined sheet into an
     existing workbook. Returns metadata for the NEWEST year-bearing bill so other
-    sheets can link its annual tax: {'sheet', 'hardcoded_cell', 'performula_cell'}."""
+    sheets can link its annual tax: {'sheet', 'hardcoded_cell', 'performula_cell'}.
+    always_combined writes the W- worksheet tab even for a single bill, so a deal
+    workbook has a worksheet for taxes like it has for every other section."""
     if not bills:
         raise ValueError("no tax bills to write")
     bills = sorted(bills, key=lambda b: (b[3] is None, b[3] or 0))
+    years = [b[3] for b in bills]
     newest = None
     for i, (data, apn, shot, year) in enumerate(bills):
         # several bills can share a year (same property, or duplicate uploads):
         # new_sheet dedupes legally instead of building an illegal "2025*"
-        ws, title = XL.new_sheet(wb, f"{prefix}{year}" if year else f"{prefix}Bill {i + 1}")
+        base = f"{prefix}{year}" if year else f"{prefix}Bill {i + 1}"
+        if year is not None and years.count(year) > 1:
+            # a multi-parcel deal: "S - Tax 2025 -002" beats "S - Tax 2025 (2)"
+            tail = re.sub(r"\D", "", str(apn or ""))[-3:]
+            if tail:
+                base = f"{base} -{tail}"
+        ws, title = XL.new_sheet(wb, base)
         last = write_bill(ws, data, apn, c0=0, screenshot_path=shot)
         if year is not None or newest is None:
             newest = {"sheet": title,
                       "hardcoded_cell": f"'{title}'!B{last}",
                       "performula_cell": f"'{title}'!B{last - 1}"}
-    if len(bills) > 1:
+    if len(bills) > 1 or always_combined:
         _write_combined(XL.new_sheet(wb, combined_name)[0], bills)
     return newest
 
@@ -1047,9 +1072,7 @@ def build_combined_workbook(bills):
     in aligned columns and a COMBINED column that adds them up (live SUM formulas)."""
     from openpyxl import Workbook
     wb = Workbook(); wb.remove(wb.active)
-    build_tax_into(wb, bills)
-    if len(bills) == 1:                 # standalone tool always shows the combined tab
-        _write_combined(XL.new_sheet(wb, "W - RE Taxes")[0], bills)
+    build_tax_into(wb, bills, always_combined=True)
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
 
@@ -1063,7 +1086,7 @@ def render():
     """Streamlit UI for the tax-bill parser (called by the sidebar router)."""
 
     with st.sidebar:
-        st.header("🏠 APN Tax Bill Tool")
+        st.header("🏠 Tax Bill Parser")
         view = st.radio("View", ["Process bills", "History"], label_visibility="collapsed")
         st.caption("Saved bills persist on Replit's filesystem.")
 
@@ -1080,7 +1103,7 @@ def render():
         ai_on = ai_available()
         if ai_on:
             always_ai = st.checkbox(
-                "🤖 Double-check every bill with AI — Claude reads the PDF directly "
+                "🤖  Double-check every bill with AI — Claude reads the PDF directly "
                 "(slower + a small cost per bill, but you won't need to hand-verify).",
                 value=False)
             st.caption("AI assist: **on** — any bill the built-in parser reads weakly is "
@@ -1199,7 +1222,7 @@ def render():
 
             # Batch actions — ONE workbook: a sheet per bill + a side-by-side Combined sheet
             st.divider()
-            if st.button("📊 Save ALL & build combined workbook", type="primary",
+            if st.button("📊  Save ALL & build combined workbook", type="primary",
                          use_container_width=True):
                 bills = []
                 for key, (edited, shot, fname, save_name) in current.items():
@@ -1210,7 +1233,7 @@ def render():
                 st.success(f"Built one workbook: {len(bills)} bill sheet(s) + a Combined sheet.")
 
             if "batch_wb" in st.session_state:
-                st.download_button("⬇ Download combined workbook (.xlsx)",
+                st.download_button("⬇  Download combined workbook (.xlsx)",
                                    data=st.session_state["batch_wb"],
                                    file_name="tax_bills_combined.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

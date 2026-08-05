@@ -1,6 +1,7 @@
 streamlit
 pdfplumber
 openpyxl
+xlrd>=2.0
 pymupdf
 pandas
 pytesseract

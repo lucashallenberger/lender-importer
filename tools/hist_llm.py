@@ -19,7 +19,7 @@ import json
 import os
 from pathlib import Path
 
-MODEL = "claude-opus-4-8"
+MODEL = "claude-opus-5"
 
 CLASSES = [
     "Income - Rental Income", "Income - Other Income",
@@ -73,8 +73,47 @@ def _save_cache(d):
         pass
 
 
+def check_refusal(resp):
+    """Opus 5 ships cybersecurity/bio classifiers that can decline a request: the
+    call returns 200 with stop_reason 'refusal' and no usable content. Surface it
+    as a readable error instead of an IndexError three frames down."""
+    if getattr(resp, "stop_reason", None) == "refusal":
+        why = getattr(getattr(resp, "stop_details", None), "explanation", None)
+        raise RuntimeError("Claude declined to process this document"
+                           + (f" — {why}" if why else "")
+                           + ". If it's an ordinary property document, re-upload it; "
+                             "otherwise enter the numbers by hand.")
+    return resp
+
+
+def _text_of(resp):
+    return "".join(b.text for b in check_refusal(resp).content if b.type == "text")
+
+
 def _json_response(resp):
-    return json.loads(next(b.text for b in resp.content if b.type == "text"))
+    return json.loads(next(b.text for b in check_refusal(resp).content if b.type == "text"))
+
+
+_SHEET_INTRO = """The document below is a SPREADSHEET rendered as text: one line per
+row, cells separated by ' | ', each sheet introduced by a '=== SHEET: name ===' banner.
+Empty cells render as blanks. Formula cells show their computed value where the file
+carries one; a cell still showing a formula (e.g. '=E2*12') is a derived column the
+file never stored a result for — ignore it and use the underlying values instead.
+Read the rest exactly as you would read the printed report."""
+
+
+def content_blocks(data, prompt):
+    """Message content for a source document. PDFs go through as a document
+    block; workbooks and CSVs are rendered to text first (the API can't read an
+    .xlsx), so every extractor accepts either without caring which it got."""
+    from tools import tabular
+    if tabular.kind(data) == "pdf":
+        return [{"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf",
+                            "data": base64.standard_b64encode(bytes(data)).decode()}},
+                {"type": "text", "text": prompt}]
+    return [{"type": "text", "text": f"{_SHEET_INTRO}\n\n{tabular.to_text(data)}"},
+            {"type": "text", "text": prompt}]
 
 
 # ---------------------------------------------------------------- 1) extraction
@@ -93,8 +132,9 @@ Rules: use the main period column if there are multiple columns. Do not invent,
 merge, or skip lines. Do not compute anything — transcribe only."""
 
 
-def extract_statement(pdf_bytes):
-    """Claude-side extraction -> rows shaped like parse_summary's output."""
+def extract_statement(data):
+    """Claude-side extraction -> rows shaped like parse_summary's output.
+    Accepts a statement PDF or a spreadsheet/CSV export of one."""
     schema = {
         "type": "object",
         "properties": {
@@ -119,15 +159,7 @@ def extract_statement(pdf_bytes):
         model=MODEL,
         max_tokens=16000,
         thinking={"type": "adaptive"},
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document",
-                 "source": {"type": "base64", "media_type": "application/pdf",
-                            "data": base64.standard_b64encode(pdf_bytes).decode()}},
-                {"type": "text", "text": _EXTRACT_PROMPT},
-            ],
-        }],
+        messages=[{"role": "user", "content": content_blocks(data, _EXTRACT_PROMPT)}],
         output_config={"format": {"type": "json_schema", "schema": schema}},
     )
     rows = []
@@ -138,6 +170,66 @@ def extract_statement(pdf_bytes):
             row["section"] = True; row["amount"] = None
         rows.append(row)
     return rows
+
+
+# ------------------------------------------------- 1b) period-aware extraction
+_PERIODS_PROMPT = """This is a property operating/income statement (P&L, cash flow
+report, or T-12). Extract every financial line in top-to-bottom order.
+
+First identify the statement's VALUE COLUMNS ("periods"):
+- A monthly statement (T-12) has one column per month — list them in printed order,
+  e.g. ["Jan-25","Feb-25",...]. Include a trailing Total / YTD column only if one is
+  actually printed, labelled exactly as printed.
+- A single-period statement has one value column — return one label for it (or "" if
+  the column is unlabelled).
+
+For each line give:
+- label: the line-item name exactly as printed (trimmed)
+- amounts: one number per period column, in the SAME ORDER as `periods` (negative if
+  negative); use null where the cell is blank
+- kind: "item" (a normal line item), "total" (a subtotal/total line), "net" (a net
+  income/NOI/cash-flow line), or "section" (a header like Income/Expenses with no
+  amounts)
+
+Rules: do not invent, merge, or skip lines. Do not compute anything — transcribe only."""
+
+
+def extract_statement_periods(data):
+    """Read a statement keeping every period column separate. Returns
+    {'periods': [label...], 'rows': [{'label','amounts','kind'}...]} — the caller
+    decides whether that's a monthly grid or a single-period statement."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "periods": {"type": "array", "items": {"type": "string"}},
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "amounts": {"type": "array",
+                                    "items": {"anyOf": [{"type": "number"}, {"type": "null"}]}},
+                        "kind": {"type": "string", "enum": ["item", "total", "net", "section"]},
+                    },
+                    "required": ["label", "amounts", "kind"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["periods", "rows"],
+        "additionalProperties": False,
+    }
+    # A T-12 is 12 numbers per line over ~40 lines, so this one runs long — stream
+    # it (the SDK refuses a non-streaming request this size, and would time out).
+    with _client().messages.stream(
+        model=MODEL,
+        max_tokens=32000,
+        thinking={"type": "adaptive"},
+        messages=[{"role": "user", "content": content_blocks(data, _PERIODS_PROMPT)}],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    ) as stream:
+        return _json_response(stream.get_final_message())
 
 
 # ---------------------------------------------------------------- 2) matching

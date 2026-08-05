@@ -12,6 +12,7 @@ plumbing as the Historicals tool; degrades to a clear message if no API key.
 
 import io
 import re
+import zlib
 from datetime import datetime
 
 import pandas as pd
@@ -61,7 +62,9 @@ For each unit:
 - lease_type: the lease term exactly as printed (e.g. "MTM", "1 year",
   "MTM since 4/25", "Airbnb 2 months begin 6/15/26"), or ""
 
-Use the primary rent column if several are shown. Keep the units in printed order."""
+Use the primary rent column if several are shown. Keep the units in printed order.
+Skip anything that isn't a unit: totals/subtotals, summary blocks, repeated page
+headers, and notes/legend rows."""
 
 _SCHEMA = {
     "type": "object",
@@ -98,22 +101,15 @@ _SCHEMA = {
 }
 
 
-def extract_rent_roll(pdf_bytes: bytes) -> dict:
-    """Claude reads the rent-roll PDF and returns the structured dict above."""
-    import base64
+def extract_rent_roll(data: bytes) -> dict:
+    """Claude reads the rent roll — PDF or spreadsheet/CSV — and returns the
+    structured dict above."""
     resp = hist_llm._client().messages.create(
         model=hist_llm.MODEL,
         max_tokens=16000,
         thinking={"type": "adaptive"},
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document",
-                 "source": {"type": "base64", "media_type": "application/pdf",
-                            "data": base64.standard_b64encode(pdf_bytes).decode()}},
-                {"type": "text", "text": _EXTRACT_PROMPT},
-            ],
-        }],
+        messages=[{"role": "user",
+                   "content": hist_llm.content_blocks(data, _EXTRACT_PROMPT)}],
         output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
     )
     return hist_llm._json_response(resp)
@@ -437,14 +433,57 @@ def _build_worksheet(ws, data, refs):
     ws.freeze_panes = "A4"
 
 
+def _tag(name: str) -> str:
+    """Short building tag for disambiguating unit labels across rent rolls."""
+    return re.sub(r"[^0-9A-Za-z]", "", str(name or ""))[:4].upper()
+
+
+def combine(rolls: list) -> dict:
+    """Merge several rent rolls into one Source/Worksheet pair — a multi-building
+    deal underwrites as one property. Unit labels that collide across buildings get
+    a building prefix ("SIER-1") so the Worksheet's unit column stays unambiguous."""
+    rolls = [r for r in rolls if (r or {}).get("units")]
+    if not rolls:
+        return None
+    if len(rolls) == 1:
+        return rolls[0]
+
+    def first(k):
+        return next((str(r.get(k)).strip() for r in rolls
+                     if str(r.get(k) or "").strip()), "")
+
+    seen, units = set(), []
+    for r in rolls:
+        tag = _tag(r.get("property_name"))
+        for u in r["units"]:
+            u = dict(u)
+            label = str(u.get("unit", "")).strip()
+            if label in seen and tag:
+                label = f"{tag}-{label}"
+            u["unit"] = label
+            seen.add(label)
+            units.append(u)
+    notes = [n for n in (str(r.get("source_note") or "").strip() for r in rolls) if n]
+    names = [n for n in (str(r.get("property_name") or "").strip() for r in rolls) if n]
+    return {
+        "property_name": first("property_name"),
+        "city_state_zip": first("city_state_zip"),
+        "apn": first("apn") or None,
+        "source_note": " · ".join(dict.fromkeys(notes)) or
+                       f"Combined from {len(rolls)} rent rolls: " + ", ".join(names),
+        "combined_from": names,
+        "units": units,
+    }
+
+
 def build_into(wb, data: dict, name="W - RR", src_name="S - RR", prop_info=None) -> dict:
     """Write the Worksheet + Source pair (and an optional Property Info cover
     sheet) into an existing workbook. Returns the Source refs for linking."""
     from tools import xl as XL
+    from tools import prop_info as PI
     if not (data or {}).get("units"):
         raise ValueError("rent roll has no units to write")
-    if prop_info:
-        from tools import prop_info as PI
+    if PI.has_any(prop_info):
         PI.build_sheet(XL.new_sheet(wb, "Property Info")[0], prop_info)
     ws = XL.new_sheet(wb, name)[0]
     src = XL.new_sheet(wb, src_name)[0]
@@ -476,38 +515,46 @@ def _df_from_units(units):
     } for i, u in enumerate(units)], columns=UNIT_COLS)
 
 
+def _txt(v):
+    """Cell -> clean string. The data editor hands back None/NaN for anything the
+    user left blank, and str() would turn those into the literal 'None'/'nan'."""
+    return "" if v is None or (not isinstance(v, str) and pd.isna(v)) else str(v).strip()
+
+
 def _units_from_df(df):
     out = []
     for row in df.itertuples(index=False):
         d = dict(zip(UNIT_COLS, row))
-        if not str(d["Unit"]).strip():
+        if not _txt(d["Unit"]):          # blank row the user added and didn't fill
             continue
         sf = d.get("SF")
         out.append({
-            "unit": str(d["Unit"]).strip(), "unit_type": str(d["Unit Type"]).strip(),
+            "unit": _txt(d["Unit"]), "unit_type": _txt(d["Unit Type"]),
             "unit_sf": (float(sf) if sf is not None and pd.notna(sf) and _num(sf) > 0 else None),
-            "monthly_rent": _num(d["Monthly Rent"]), "status": str(d["Status"]).strip(),
-            "lease_name": str(d["Lease Name"]).strip(), "lease_status": str(d["Lease Status"]).strip(),
-            "move_in_date": str(d["Move-In Date"]).strip(), "lease_end": str(d["Lease End"]).strip(),
-            "lease_type": str(d["Lease Term"]).strip(), "notes": str(d["Notes"]).strip(),
+            "monthly_rent": _num(d["Monthly Rent"]), "status": _txt(d["Status"]),
+            "lease_name": _txt(d["Lease Name"]), "lease_status": _txt(d["Lease Status"]),
+            "move_in_date": _txt(d["Move-In Date"]), "lease_end": _txt(d["Lease End"]),
+            "lease_type": _txt(d["Lease Term"]), "notes": _txt(d["Notes"]),
         })
     return out
 
 
 def render():
+    from tools import tabular
     st.header("🏘️ Rent Roll Parser")
-    st.caption("Upload a rent-roll PDF. You get one workbook: a **Source** tab (faithful "
-               "PDF→Excel transcription) and a **Worksheet** tab (underwriting format) whose "
-               "shared values link by formula back to the Source tab.")
+    st.caption("Upload a rent roll — PDF, Excel or CSV. You get one workbook: a **Source** "
+               "tab (faithful transcription) and a **Worksheet** tab (underwriting format) "
+               "whose shared values link by formula back to the Source tab.")
 
     if not hist_llm.available():
         st.warning("This tool reads rent rolls with Claude — set **ANTHROPIC_API_KEY** in the "
                    "app secrets to enable it. (Rent-roll layouts vary too much for a fixed parser.)")
         return
 
-    files = st.file_uploader("Rent roll PDF(s)", type=["pdf"], accept_multiple_files=True)
+    files = st.file_uploader("Rent roll(s) — PDF / Excel / CSV",
+                             type=tabular.UPLOAD_TYPES, accept_multiple_files=True)
     if not files:
-        st.info("Upload a rent-roll PDF to begin.")
+        st.info("Upload a rent roll to begin.")
         return
 
     parsed = st.session_state.setdefault("rr_parsed", {})
@@ -526,11 +573,13 @@ def render():
         if k not in live:
             del parsed[k]
 
+    shown = set()
     for f in files:
         key = f"{f.name}:{f.size}"
         data = parsed.get(key)
-        if not data:
-            continue
+        if not data or key in shown:
+            continue          # the same file dropped in twice — one set of widgets
+        shown.add(key)        # (duplicate widget keys crash the page)
         with st.expander(f"📄 {f.name}  —  {data.get('property_name') or '?'}",
                          expanded=len(files) == 1):
             c1, c2, c3 = st.columns(3)
@@ -541,7 +590,7 @@ def render():
 
             # ── Property Info cover sheet (web lookup by APN) ────────────
             from tools import prop_info as PI
-            if st.button("🔎 Look up property info on the web (by APN)", key=f"pib_{key}",
+            if st.button("🔎  Look up property info on the web (by APN)", key=f"pib_{key}",
                          disabled=not apn.strip()):
                 zc = re.search(r"\b(\d{5})\b", csz or "")
                 with st.spinner(f"Researching APN {apn} on the web…"):
@@ -554,21 +603,29 @@ def render():
             if pinfo and pinfo.get("verified_address"):
                 st.info(f"📍 Verified as: **{pinfo['verified_address']}** — wrong property? "
                         "Fix the City/State/ZIP above and re-run the lookup.")
-            if pinfo is not None:
-                st.markdown("**Property Info** (from web — verify & edit; blanks stay "
-                            "blank on the sheet)")
+            elif pinfo is not None and not PI.has_any(pinfo):
+                st.warning("The web lookup came back empty — the Property Info tab is still "
+                           "built from the rent roll; fill in the blanks below.")
+            # the rent roll's own header seeds the cover sheet, so the tab exists
+            # whether or not the web lookup ran
+            pi_base = PI.merge(PI.from_rent_roll(
+                {"property_name": pname, "city_state_zip": csz, "apn": apn,
+                 "units": data.get("units")}), pinfo)
+            with st.expander("Property Info tab (verify & edit; blanks stay blank on the sheet)",
+                             expanded=pinfo is not None):
                 pi_edit = {}
                 left, mid_, right_ = st.columns(3)
                 cols3 = [left, mid_, right_]
                 fields = PI.PROP_FIELDS[:2] + [("", "address_line2")] + PI.PROP_FIELDS[2:] + PI.BLDG_FIELDS
+                sig = zlib.crc32("|".join(str(pi_base.get(k)) for k in PI.ALL_KEYS).encode())
                 for j, (label, k) in enumerate(fields):
-                    v = pinfo.get(k)
+                    v = pi_base.get(k)
                     pi_edit[k] = cols3[j % 3].text_input(label or "Address line 2",
                                                          value="" if v is None else str(v),
-                                                         key=f"pif_{k}_{key}")
+                                                         key=f"pif_{k}_{key}_{sig}")
                 # numbers back to numbers where possible
                 for k, v in pi_edit.items():
-                    v = v.strip()
+                    v = (v or "").strip()
                     if v == "":
                         pi_edit[k] = None
                     else:
@@ -576,7 +633,7 @@ def render():
                             pi_edit[k] = float(v) if "." in v else int(v)
                         except ValueError:
                             pi_edit[k] = v
-                st.session_state[f"pinfo_edit_{key}"] = pi_edit
+                st.session_state[f"pinfo_edit_{key}"] = {**pi_base, **pi_edit}
 
             st.markdown("**Units** (edit any cell to correct the extraction)")
             df = st.data_editor(_df_from_units(data["units"]), num_rows="dynamic",
@@ -588,7 +645,7 @@ def render():
             if edited["units"]:
                 xlsx = build_workbook(edited, prop_info=st.session_state.get(f"pinfo_edit_{key}"))
                 stem = re.sub(r'[^0-9A-Za-z]+', "_", (pname or f.name)).strip("_") or "rent_roll"
-                st.download_button("⬇ Download workbook (.xlsx)", data=xlsx,
+                st.download_button("⬇  Download workbook (.xlsx)", data=xlsx,
                                    file_name=f"{stem}_RentRoll.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    key=f"dl_{key}", use_container_width=True)
