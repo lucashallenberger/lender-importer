@@ -1086,9 +1086,10 @@ def render():
     """Streamlit UI for the tax-bill parser (called by the sidebar router)."""
 
     with st.sidebar:
-        st.header("🏠 Tax Bill Parser")
+        # the app sidebar already names the tool — this is just its two views
+        st.divider()
         view = st.radio("View", ["Process bills", "History"], label_visibility="collapsed")
-        st.caption("Saved bills persist on Replit's filesystem.")
+        st.caption("History is kept on the server and clears when the app redeploys.")
 
 
     # ─── PROCESS TAB ───────────────────────────────────────────────────────────
