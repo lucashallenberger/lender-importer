@@ -8,6 +8,7 @@ is written to the server. That Salesforce login is itself the access gate.
 
 import base64
 import json
+import os
 
 import streamlit as st
 
@@ -24,6 +25,8 @@ def _api() -> Api:
 
 def _storage():
     """Browser localStorage handle for 'remember me' (optional; None if unavailable)."""
+    if os.getenv("QCP_NO_LOCALSTORAGE"):    # headless tests have no browser to answer
+        return None
     try:
         from streamlit_local_storage import LocalStorage
         return LocalStorage()

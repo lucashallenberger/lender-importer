@@ -102,19 +102,20 @@ file never stored a result for — ignore it and use the underlying values inste
 Read the rest exactly as you would read the printed report."""
 
 
-def content_blocks(data, prompt, transform=None):
+def content_blocks(data, prompt, transform=None, sheet=None):
     """Message content for a source document. PDFs go through as a document
     block; workbooks and CSVs are rendered to text first (the API can't read an
     .xlsx), so every extractor accepts either without caring which it got.
     `transform` gets a crack at the rendering — a caller that knows some of the
-    sheet is noise can drop it before it's paid for."""
+    sheet is noise can drop it before it's paid for. `sheet` narrows a workbook
+    to one tab, for a file that holds a separate statement per tab."""
     from tools import tabular
     if tabular.kind(data) == "pdf":
         return [{"type": "document",
                  "source": {"type": "base64", "media_type": "application/pdf",
                             "data": base64.standard_b64encode(bytes(data)).decode()}},
                 {"type": "text", "text": prompt}]
-    rendered = tabular.to_text(data)
+    rendered = tabular.to_text(data, only=sheet)
     if transform:
         rendered = transform(rendered)
     return [{"type": "text", "text": f"{_SHEET_INTRO}\n\n{rendered}"},
@@ -177,6 +178,52 @@ def extract_statement(data):
     return rows
 
 
+# ------------------------------------------------- 1a) which tabs are statements
+_TABS_PROMPT = """Below is a preview of each sheet in one workbook: the sheet name,
+then its first few rows.
+
+Decide whether this workbook holds SEVERAL SEPARATE operating statements, one per
+sheet — the usual shape is one fiscal period per tab ("2024", "2023", "25 YTD"),
+each sheet a self-contained income statement for that period.
+
+Return the sheet names that are each a standalone statement, in the workbook's own
+order. Return an EMPTY list if:
+- the workbook is a single statement (however many sheets support it), or
+- the sheets are a mix of unrelated schedules (a rent roll, a budget, a summary,
+  assumptions), rather than the same statement repeated per period.
+
+Never include a cover page, an alert/notice sheet, a notes sheet, a rent roll, a
+budget, or a combined/summary sheet that consolidates the others."""
+
+
+def statement_tabs(data, max_lines=12, max_line=200):
+    """The sheets of a workbook that are each a separate statement, or [] when
+    the file is one statement. A preview of each sheet is enough to tell, and a
+    cheap call here saves a full read of every tab in a workbook that only has
+    one statement in it."""
+    from tools import tabular
+    segs = tabular.split_sheets(tabular.to_text(data))
+    if len(segs) < 2:
+        return []
+    preview = "\n\n".join(
+        f"=== SHEET: {name} ===\n" + "\n".join(
+            l[:max_line] for l in body.strip().splitlines()[:max_lines])
+        for name, body in segs)
+    known = [n for n, _ in segs]
+    schema = {
+        "type": "object",
+        "properties": {"sheets": {"type": "array", "items": {"type": "string"}}},
+        "required": ["sheets"], "additionalProperties": False,
+    }
+    resp = _client().messages.create(
+        model=MODEL, max_tokens=4000, thinking={"type": "adaptive"},
+        messages=[{"role": "user", "content": f"{preview}\n\n{_TABS_PROMPT}"}],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    )
+    picked = [s for s in _json_response(resp)["sheets"] if s in known]
+    return picked if len(picked) > 1 else []      # one tab is just the file itself
+
+
 # ------------------------------------------------- 1b) period-aware extraction
 _PERIODS_PROMPT = """This is a property operating/income statement (P&L, cash flow
 report, or T-12). Extract every financial line in top-to-bottom order.
@@ -199,10 +246,12 @@ For each line give:
 Rules: do not invent, merge, or skip lines. Do not compute anything — transcribe only."""
 
 
-def extract_statement_periods(data):
-    """Read a statement keeping every period column separate. Returns
+def extract_statement_periods(data, sheet=None):
+    """Read ONE statement keeping every period column separate. Returns
     {'periods': [label...], 'rows': [{'label','amounts','kind'}...]} — the caller
-    decides whether that's a monthly grid or a single-period statement."""
+    decides whether that's a monthly grid or a single-period statement.
+    `sheet` picks a single tab: a workbook with a year per tab is four
+    statements, and asking for all of them at once gets them merged into one."""
     schema = {
         "type": "object",
         "properties": {
@@ -231,7 +280,8 @@ def extract_statement_periods(data):
         model=MODEL,
         max_tokens=32000,
         thinking={"type": "adaptive"},
-        messages=[{"role": "user", "content": content_blocks(data, _PERIODS_PROMPT)}],
+        messages=[{"role": "user",
+                   "content": content_blocks(data, _PERIODS_PROMPT, sheet=sheet)}],
         output_config={"format": {"type": "json_schema", "schema": schema}},
     ) as stream:
         return _json_response(stream.get_final_message())

@@ -11,6 +11,16 @@ from tools import hist_llm
 from tools import tabular
 
 
+def _tab_label(file_label, tab, n_tabs):
+    """One statement per file keeps the label the user typed. A file holding
+    several takes each tab's own name where that names the period ('2024',
+    '25 YTD') — that name is what the column header should read."""
+    if n_tabs < 2 or not tab:
+        return file_label
+    tab = tab.strip()
+    return tab if re.search(r'\d', tab) else f"{file_label} {tab}".strip()
+
+
 def _guess_label(name):
     m = re.search(r'(20\d{2})', name)
     yr = m.group(1) if m else name.rsplit('.', 1)[0][:12]
@@ -75,15 +85,26 @@ def render():
                         st.error(f"'{label}' is a spreadsheet — reading it needs "
                                  "ANTHROPIC_API_KEY set in the app secrets.")
                         return
-                    got = hist_llm.extract_statement_periods(data)
-                    periods, rows = got.get("periods") or [], got.get("rows") or []
-                    det = S.detail_from_periods(periods, rows)
-                    from_sheets.append(label + (" (monthly)" if det else ""))
-                    if det:
-                        details.append({"label": label, **det})
-                    else:
-                        summaries.append({"label": label,
-                                          "rows": S.summary_from_periods(periods, rows)})
+                    # A workbook often holds one statement per tab — a year each.
+                    # Each is read on its own: asked for the whole file at once,
+                    # the reader returns the tabs merged into a single column.
+                    # Tabs without figures (cover, alert, notes) are skipped
+                    # before they cost a read.
+                    cand = hist_llm.statement_tabs(data) or [None]
+                    for tab in cand:
+                        got = hist_llm.extract_statement_periods(data, sheet=tab)
+                        periods, rows = got.get("periods") or [], got.get("rows") or []
+                        if not any(a is not None for r in rows
+                                   for a in (r.get("amounts") or [])):
+                            continue              # nothing to put in a column
+                        lbl = _tab_label(label, tab, len(cand))
+                        det = S.detail_from_periods(periods, rows)
+                        from_sheets.append(lbl + (" (monthly)" if det else ""))
+                        if det:
+                            details.append({"label": lbl, **det})
+                        else:
+                            summaries.append({"label": lbl,
+                                              "rows": S.summary_from_periods(periods, rows)})
                 elif kind == "summary":
                     rows = S.parse_summary(data)
                     # weak parse (unfamiliar format)? -> let Claude read the PDF

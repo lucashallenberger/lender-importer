@@ -48,13 +48,42 @@ def is_spreadsheet(data) -> bool:
     return kind(data) != "pdf"
 
 
-def to_text(data) -> str:
-    """Render a workbook / CSV as text. Raises with a readable message if the
-    file can't be opened."""
+def sheet_names(data) -> list:
+    """Visible sheet titles in workbook order, or [] for anything that isn't a
+    workbook. A workbook often holds one statement per sheet — a year per tab —
+    and each has to be read on its own, so callers need the list first."""
+    k = kind(data)
+    if k == "xlsx":
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(bytes(data)), read_only=True)
+        try:
+            return [ws.title for ws in wb.worksheets if ws.sheet_state == "visible"]
+        finally:
+            wb.close()
+    if k == "xls":
+        import pandas as pd
+        return [str(n) for n in pd.read_excel(io.BytesIO(bytes(data)), sheet_name=None,
+                                              header=None, nrows=0)]
+    return []
+
+
+def split_sheets(text: str) -> list:
+    """[(sheet name, that sheet's slice of the rendering)]. to_text() banners
+    every sheet, so a caller can weigh them one at a time without re-reading the
+    file — cheaper than a round trip per tab to find out what each one holds."""
+    parts = re.split(r'^=== SHEET: (.*) ===$', text or "", flags=re.M)
+    return [(parts[i].strip(), parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+
+
+def to_text(data, only=None) -> str:
+    """Render a workbook / CSV as text. `only` renders that one sheet — the rest
+    are still read, so cross-sheet references still resolve. Raises with a
+    readable message if the file can't be opened."""
     k = kind(data)
     if k == "pdf":
         raise ValueError("to_text() got a PDF — use the PDF path instead")
-    out = _xlsx_text(data) if k == "xlsx" else _xls_text(data) if k == "xls" else _csv_text(data)
+    out = (_xlsx_text(data, only) if k == "xlsx" else
+           _xls_text(data, only) if k == "xls" else _csv_text(data))
     if len(out) > MAX_CHARS:
         out = out[:MAX_CHARS] + "\n… [rendering truncated — file is very large]"
     return out
@@ -131,7 +160,7 @@ _REF_HERE = re.compile(r"^=\s*\$?([A-Z]{1,3})\$?(\d+)\s*$")
 _REF_SHEET = re.compile(r"^=\s*(?:'([^']+)'|([^'!*?\[\]/\\]+))!\$?([A-Z]{1,3})\$?(\d+)\s*$")
 
 
-def _xlsx_text(data) -> str:
+def _xlsx_text(data, only=None) -> str:
     import openpyxl
     try:
         wb = openpyxl.load_workbook(io.BytesIO(bytes(data)), data_only=True)
@@ -149,7 +178,7 @@ def _xlsx_text(data) -> str:
     # links), but only the visible ones are rendered
     grids, pending, visible = {}, [], []      # title -> rows; [(title, ri, ci, formula)]
     for ws in wb.worksheets:
-        if ws.sheet_state == "visible":
+        if ws.sheet_state == "visible" and (only is None or ws.title == only):
             visible.append(ws.title)
         wsf = wbf[ws.title] if (wbf is not None and ws.title in wbf.sheetnames) else None
         nrow = min(ws.max_row or 0, MAX_ROWS)
@@ -207,7 +236,7 @@ def _resolve_refs(grids, pending):
             break
 
 
-def _xls_text(data) -> str:
+def _xls_text(data, only=None) -> str:
     try:
         import pandas as pd
         sheets = pd.read_excel(io.BytesIO(bytes(data)), sheet_name=None,
@@ -219,6 +248,8 @@ def _xls_text(data) -> str:
         raise ValueError(f"could not open this .xls ({e}) — try re-saving it as .xlsx") from e
     parts = []
     for name, df in sheets.items():
+        if only is not None and str(name) != only:
+            continue
         rows = [[_fmt(v) for v in rec] for rec in df.head(MAX_ROWS).itertuples(index=False)]
         if len(df) > MAX_ROWS:
             rows.append([f"… [{len(df) - MAX_ROWS} more rows not shown]"])
