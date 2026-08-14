@@ -181,7 +181,7 @@ def _seed_pinfo(docs) -> dict:
     return PI.merge(*layers)
 
 
-def build_underwriting(prop_info, rr_data, tax_bills, summaries, detail, use_llm=True):
+def build_underwriting(prop_info, rr_data, tax_bills, summaries, details, use_llm=True):
     from openpyxl import Workbook
     from tools import xl as XL
     wb = Workbook(); wb.remove(wb.active)
@@ -189,8 +189,8 @@ def build_underwriting(prop_info, rr_data, tax_bills, summaries, detail, use_llm
         PI.build_sheet(XL.new_sheet(wb, "Property Info")[0], prop_info)
     if rr_data and rr_data.get("units"):
         RR.build_into(wb, rr_data, name="W - RR", src_name="S - RR")
-    if summaries or detail:
-        ST.build_into(wb, summaries, detail, use_llm=use_llm, combined_title="W - Historicals")
+    if summaries or details:
+        ST.build_into(wb, summaries, details, use_llm=use_llm, combined_title="W - Historicals")
     if tax_bills:
         TX.build_tax_into(wb, tax_bills, prefix="S - Tax ", combined_name="W - RE Taxes",
                           always_combined=True)
@@ -467,7 +467,7 @@ def render():
     # ── build ────────────────────────────────────────────────────────────
     st.subheader("4 · Build" if review else "2 · Build")
     if st.button("🏗️  Build workbook", type="primary"):
-        rolls, tax_bills, summaries, detail = [], [], [], None
+        rolls, tax_bills, summaries, details = [], [], [], []
         for key, doc in docs.items():
             p = doc.get("parsed")
             if not p or doc["kind"] == "other":
@@ -484,11 +484,9 @@ def render():
                 label = label or _stmt_label(doc["fname"])
                 if doc["kind"] == "summary" or p.get("as_summary"):
                     summaries.append({"label": label, "rows": p["rows"]})
-                else:
-                    if detail:
-                        st.warning(f"Multiple detail statements — using the first, skipping {doc['fname']}.")
-                    else:
-                        detail = {"label": label, **{k: p[k] for k in ("cats", "totals", "months")}}
+                else:                       # every monthly statement keeps its months
+                    details.append({"label": label,
+                                    **{k: p[k] for k in ("cats", "totals", "months")}})
         rr_data = RR.combine(rolls)
         if len(rolls) > 1:
             st.info(f"Combined {len(rolls)} rent rolls into one worksheet — "
@@ -511,16 +509,22 @@ def render():
         try:
             with st.spinner("Assembling workbook…"):
                 xb = build_underwriting(final_pinfo, rr_data, tax_bills, summaries,
-                                        detail, use_llm=ai_on)
+                                        details, use_llm=ai_on)
         except Exception as e:  # noqa: BLE001
             st.error(f"Build failed: {e}")
             return
         parts = [lbl for lbl, ok in [("property info", PI.has_any(final_pinfo)),
                                      ("rent roll", rr_data),
                                      (f"{len(tax_bills)} tax bill(s)", tax_bills),
-                                     (f"{len(summaries)} statement(s)" + (" + detail" if detail else ""),
-                                      summaries or detail)] if ok]
+                                     (f"{len(summaries)} statement(s)"
+                                      + (f" + {len(details)} month-by-month" if details else ""),
+                                      summaries or details)] if ok]
         st.success("Built from: " + ", ".join(parts))
+        if ST.LAST_LLM_ERROR:
+            st.warning("The AI pass over the statements failed, so the Historicals tab fell back "
+                       "to the built-in rules — categories aren't aligned across years and line "
+                       "items aren't classified. The numbers themselves are unaffected.\n\n"
+                       f"`{ST.LAST_LLM_ERROR}`")
         prop = (rr_data or {}).get("property_name") or final_pinfo.get("property_name") or "deal"
         stem = re.sub(r"[^0-9A-Za-z]+", "_", str(prop)).strip("_") or "deal"
         st.session_state["uw_xb"] = (xb, f"{stem}_Underwriting.xlsx")

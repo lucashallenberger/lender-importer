@@ -9,4 +9,6 @@ pillow
 simple-salesforce>=1.12
 streamlit-local-storage
 streamlit-sortables
-anthropic
+# every Claude call passes output_config= (structured outputs), which older SDKs
+# reject with a TypeError before the request is ever sent
+anthropic>=0.117

@@ -188,7 +188,9 @@ def detail_from_periods(periods, rows, min_months=3):
     if len(cols) < min_months:
         return None
     months = [(k, datetime.date(int(k[:4]), int(k[5:]), 1).strftime('%b-%y')) for _, k in cols]
-    cats, totals = {}, {}
+    # 'spine' keeps the printed line order — sections and totals included — so a
+    # workbook built from monthly statements alone still reads like the statement
+    cats, totals, spine = {}, {}, []
     for r in rows or []:
         label = str(r.get('label') or '').strip()
         if not label:
@@ -196,14 +198,21 @@ def detail_from_periods(periods, rows, min_months=3):
         amounts = r.get('amounts') or []
         vals = {k: _amt(amounts[i]) for i, k in cols
                 if i < len(amounts) and _amt(amounts[i]) is not None}
-        if r.get('kind') in ('total', 'net'):
+        kind = r.get('kind')
+        if kind == 'section':
+            spine.append({'label': label, 'amount': None, 'section': True})
+        elif kind in ('total', 'net'):
             if vals:      # a blank printed total is missing, not zero
                 # parse_detail keys totals by the category name, not "Total <name>"
-                totals[re.sub(r'^total\s+', '', label, flags=re.I).strip()] = \
-                    round(sum(vals.values()), 2)
-        elif r.get('kind') == 'item' and vals:
+                amount = round(sum(vals.values()), 2)
+                totals[re.sub(r'^total\s+', '', label, flags=re.I).strip()] = amount
+                spine.append({'label': label, 'amount': amount,
+                              'total': kind == 'total', 'net': kind == 'net'})
+        elif kind == 'item' and vals:
             cats[label] = vals
-    return {'cats': cats, 'totals': totals, 'months': months} if cats else None
+            spine.append({'label': label, 'amount': round(sum(vals.values()), 2),
+                          'total': False, 'net': False})
+    return {'cats': cats, 'totals': totals, 'months': months, 'spine': spine} if cats else None
 
 
 def summary_from_periods(periods, rows):
@@ -275,15 +284,46 @@ def classify(label):
 
 
 # ---------------------------------------------------------------- assemble
-def _llm_refine(summaries, detail):
+# Why the Claude pass last fell back to the deterministic rules, or None. A
+# failure here still yields a workbook — just an unaligned, unclassified one —
+# so callers read this after building and say so rather than letting a broken
+# combined tab pass for a good one.
+LAST_LLM_ERROR = None
+
+
+def _as_details(detail):
+    """The detail argument, as a list. Callers may pass one monthly statement, a
+    list of them, or None — every statement that came in as a month-by-month grid
+    keeps its months, so two T-12s stay two T-12s."""
+    if not detail:
+        return []
+    ds = [detail] if isinstance(detail, dict) else list(detail)
+    return sorted(ds, key=lambda d: str(d.get('label') or ''))
+
+
+def _detail_spine(d):
+    """Row spine from a monthly statement, for a build with no summary statement
+    to take one from: its own printed line order where the reader recorded one,
+    else its categories followed by its totals."""
+    if d.get('spine'):
+        return d['spine']
+    rows = [{'label': k, 'amount': round(sum(v.values()), 2), 'total': False, 'net': False}
+            for k, v in d['cats'].items()]
+    return rows + [{'label': k, 'amount': v, 'total': True, 'net': False}
+                   for k, v in (d['totals'] or {}).items()]
+
+
+def _llm_refine(summaries, details):
     """Ask Claude to (a) align variant names onto the newest summary's labels,
     (b) classify all line items, and (c) flag which labels are total/subtotal/net
     rows. Returns (alias_map canon->canon, class_map canon->class, total_keys set
     of canon labels). Empty when no API key / any failure."""
+    global LAST_LLM_ERROR
+    LAST_LLM_ERROR = None
     try:
         from tools import hist_llm
         if not hist_llm.available():
-            return {}, {}, set()
+            return {}, {}, set()          # switched off, not broken
         spine_labels = [r['label'] for r in (summaries[-1]['rows'] if summaries else [])
                         if r.get('amount') is not None and not r.get('total') and not r.get('net')]
         spine_keys = {canon(l) for l in spine_labels}
@@ -291,8 +331,8 @@ def _llm_refine(summaries, detail):
         for sm in summaries[:-1]:
             others += [r['label'] for r in sm['rows']
                        if r.get('amount') is not None and not r.get('total') and not r.get('net')]
-        if detail:
-            others += list(detail['cats'].keys())
+        for d in details:
+            others += list(d['cats'].keys())
         unmatched = sorted({l for l in others if canon(l) not in spine_keys})
         amap = {}
         for src, tgt in hist_llm.match_labels(unmatched, spine_labels).items():
@@ -302,10 +342,11 @@ def _llm_refine(summaries, detail):
         cmap = {canon(l): c for l, c in hist_llm.classify_labels(all_items).items()}
         # every label (incl. totals/sections) so Claude can flag total rows to bold
         every = sorted({r['label'] for sm in summaries for r in sm['rows']}
-                       | ({*detail['cats'], *(detail['totals'] or {})} if detail else set()))
+                       | {l for d in details for l in (*d['cats'], *(d['totals'] or {}))})
         tset = {canon(l) for l, role in hist_llm.label_roles(every).items() if role == 'total'}
         return amap, cmap, tset
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        LAST_LLM_ERROR = f"{type(e).__name__}: {e}"
         return {}, {}, set()
 
 
@@ -313,17 +354,21 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
                src_prefix='S - '):
     """Write the combined + source sheets into an existing workbook. Returns
     metadata for cross-sheet linking (classification SUMIFs on the combined tab).
-    summaries: [{'label','rows'}] oldest->newest. detail: {'label','cats','totals','months'} or None.
+    summaries: [{'label','rows'}] oldest->newest. detail: one
+    {'label','cats','totals','months'}, a list of them, or None — each gets its
+    own month-column block, so a year that arrived month-by-month stays that way.
     use_llm: when an ANTHROPIC_API_KEY is available, Claude aligns variant names,
     classifies line items, and flags total rows to bold; otherwise the
     deterministic rules run alone."""
-    amap, cmap, tset = _llm_refine(summaries, detail) if use_llm else ({}, {}, set())
+    details = _as_details(detail)
+    amap, cmap, tset = _llm_refine(summaries, details) if use_llm else ({}, {}, set())
 
     def C(s):
         k = canon(s)
         return amap.get(k, k)
 
-    spine_src = summaries[-1]['rows'] if summaries else []
+    spine_src = (summaries[-1]['rows'] if summaries
+                 else _detail_spine(details[-1]) if details else [])
     spine = [dict(r) for r in spine_src]
     spine_items = {C(r['label']) for r in spine_src if r.get('amount') is not None and not r['total'] and not r.get('net')}
 
@@ -333,10 +378,10 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
         for r in sm['rows']:
             if r.get('amount') is not None and not r['total'] and not r.get('net') and C(r['label']) not in seen:
                 extras.append(dict(r, _only=sm['label'])); seen.add(C(r['label']))
-    cats = detail['cats'] if detail else {}
-    for name in cats:
-        if C(name) not in seen:
-            extras.append({'label': name, 'amount': 0.0, '_only': detail['label']}); seen.add(C(name))
+    for d in details:
+        for name in d['cats']:
+            if C(name) not in seen:
+                extras.append({'label': name, 'amount': 0.0, '_only': d['label']}); seen.add(C(name))
 
     # Insert each extra NEXT TO the spine items it belongs with (same classification,
     # else same top-level group) instead of dumping them all at the bottom. Keeps a
@@ -364,24 +409,23 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
             pos = len(spine)                  # items like mortgage/deposits) -> append;
         spine.insert(pos, ex)                 # same-class followers cluster after it
 
-    months = detail['months'] if detail else []
-    nM = len(months)
-    cats_c = {C(k): k for k in cats}
-    tot_c = {C(k): k for k in (detail['totals'] if detail else {})}
+    # one record per monthly statement — its own months and lookups now, its own
+    # column block and source tab below
+    dets = [{'d': d, 'months': d['months'], 'nM': len(d['months']),
+             'cats_c': {C(k): k for k in d['cats']},
+             'tot_c': {C(k): k for k in (d['totals'] or {})}} for d in details]
 
-    def ytd_item(label):
-        k = C(label)
-        if k in cats_c:
-            return cats_c[k]
-        m = difflib.get_close_matches(k, list(cats_c), n=1, cutoff=0.86)
-        return cats_c[m[0]] if m else None
+    def _near(key, table):
+        if key in table:
+            return table[key]
+        m = difflib.get_close_matches(key, list(table), n=1, cutoff=0.86)
+        return table[m[0]] if m else None
 
-    def ytd_total(label):
-        name = re.sub(r'^total\s+', '', C(label))
-        if name in tot_c:
-            return tot_c[name]
-        m = difflib.get_close_matches(name, list(tot_c), n=1, cutoff=0.86)
-        return tot_c[m[0]] if m else None
+    def ytd_item(dt, label):
+        return _near(C(label), dt['cats_c'])
+
+    def ytd_total(dt, label):
+        return _near(re.sub(r'^total\s+', '', C(label)), dt['tot_c'])
 
     # per-summary lookups (canon -> full row) + how many value columns each has
     smaps = [{C(r['label']): r for r in sm['rows'] if r.get('amount') is not None} for sm in summaries]
@@ -397,10 +441,9 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
         ws, title = XL.new_sheet(wb, src_prefix + str(sm['label']))
         ws.append(['Line', sm['label']] + [f'Col {j}' for j in range(2, ncols[si] + 1)])
         stab_names.append(title); stabs.append((sm, ws))
-    dtab = dtab_name = None
-    if detail:
-        dtab, dtab_name = XL.new_sheet(wb, src_prefix + str(detail['label']))
-        dtab.append(['Line'] + [l for _, l in months] + ['YTD Total'])
+    for dt in dets:
+        dt['tab'], dt['tab_name'] = XL.new_sheet(wb, src_prefix + str(dt['d']['label']))
+        dt['tab'].append(['Line'] + [l for _, l in dt['months']] + ['YTD Total'])
 
     def put(ws, row, col, val, red=False, bold=False):
         c = ws.cell(row, col, val)
@@ -422,35 +465,31 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
     for si, sm in enumerate(summaries):
         sum_blocks.append((si, col, col + 1)); sum_val_cols.append(col + 1); col += 2
         _sep()
-    det_L = det_M0 = det_T = None
-    if detail:
-        det_L, det_M0 = col, col + 1
-        det_T = det_M0 + nM
-        col = det_T + 1
+    for dt in dets:                  # months, then that statement's own YTD + recon
+        dt['L'], dt['M0'] = col, col + 1
+        dt['T'] = dt['M0'] + dt['nM']
+        col = dt['T'] + 1
         _sep()
-    RECON = None
-    if detail:                       # reconciles the detail's months against its YTD
-        RECON = col; col += 1
+        dt['RECON'] = col; col += 1
         _sep()
     # compact year-over-year block on the far right: values only, one column per
     # source, so big differences jump out without scanning the wide blocks
     CMP = []                 # (compact col, source value col on this sheet, header)
     for si, sm in enumerate(summaries):
         CMP.append((col, sum_val_cols[si], sm['label'])); col += 1
-    if detail:
-        CMP.append((col, det_T, detail['label'])); col += 1
+    for dt in dets:
+        CMP.append((col, dt['T'], dt['d']['label'])); col += 1
 
     # header
     comb.cell(1, CLS, 'Classification')
     for si, Lc, Vc in sum_blocks:
         comb.cell(1, Lc, summaries[si]['label'])
-    if detail:
-        comb.cell(1, det_L, detail['label'])
-        for j, (_, lbl) in enumerate(months):
-            comb.cell(1, det_M0 + j, lbl)
-        comb.cell(1, det_T, 'YTD Total')
-    if RECON:
-        comb.cell(1, RECON, 'Recon')
+    for dt in dets:
+        comb.cell(1, dt['L'], dt['d']['label'])
+        for j, (_, lbl) in enumerate(dt['months']):
+            comb.cell(1, dt['M0'] + j, lbl)
+        comb.cell(1, dt['T'], 'YTD Total')
+        comb.cell(1, dt['RECON'], 'Recon')
     for cc, _srcc, hdr in CMP:
         comb.cell(1, cc, hdr)
 
@@ -471,22 +510,26 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
             amts = (m.get('amounts') or [m['amount']]) if m else ([None] if is_sec else [0])
             for j in range(ncols[si]):
                 ws.cell(row, 2 + j, amts[j] if j < len(amts) else None)
-        cm = None if is_sec else (ytd_item(label) if detail else None)
-        tm = ytd_total(label) if (detail and is_tot) else None
-        if detail:
-            dtab.cell(row, 1, cm if cm else (tm if tm else label))
+        for dt in dets:
+            cm = None if is_sec else ytd_item(dt, label)
+            tm = ytd_total(dt, label) if is_tot else None
+            dt['cm'], dt['tm'] = cm, tm
+            tab, nM, cats = dt['tab'], dt['nM'], dt['d']['cats']
+            # tm is the totals *key* ("Income"), never the printed wording — a
+            # total row shows its own label, not the category it sums
+            tab.cell(row, 1, cm or label)
             if is_tot and tm:
-                dtab.cell(row, 1 + nM + 1, detail['totals'].get(tm))
+                tab.cell(row, 1 + nM + 1, (dt['d']['totals'] or {}).get(tm))
             elif cm:
-                for j, (mk, _) in enumerate(months):
-                    dtab.cell(row, 2 + j, round(cats[cm].get(mk, 0.0), 2))
-                dtab.cell(row, 1 + nM + 1, round(sum(cats[cm].values()), 2))
+                for j, (mk, _) in enumerate(dt['months']):
+                    tab.cell(row, 2 + j, round(cats[cm].get(mk, 0.0), 2))
+                tab.cell(row, 1 + nM + 1, round(sum(cats[cm].values()), 2))
 
         if is_sec:
             for si, Lc, Vc in sum_blocks:
                 put(comb, row, Lc, label, bold=True)
-            if detail:
-                put(comb, row, det_L, label, bold=True)
+            for dt in dets:
+                put(comb, row, dt['L'], label, bold=True)
             continue
         if not is_tot:
             c = comb.cell(row, CLS, cmap.get(canon(label)) or classify(label))
@@ -497,40 +540,46 @@ def build_into(wb, summaries, detail, use_llm=True, combined_title='W - Historic
             present = C(label) in smaps[si] or r.get('_only') == summaries[si]['label']
             put(comb, row, Lc, f"='{stab_names[si]}'!A{row}", red=not present, bold=is_tot)
             put(comb, row, Vc, f"='{stab_names[si]}'!B{row}", red=not present, bold=is_tot).number_format = CUR
-        # detail block
-        if detail:
-            p26 = bool(cm) or bool(tm) or r.get('_only') == detail['label']
-            dl = dtab_name
-            put(comb, row, det_L, f"='{dl}'!A{row}", red=not p26, bold=is_tot)
+        # detail blocks — one per monthly statement
+        dpres = []
+        for dt in dets:
+            present = bool(dt['cm']) or bool(dt['tm']) or r.get('_only') == dt['d']['label']
+            dpres.append(present)
+            dl, nM = dt['tab_name'], dt['nM']
+            put(comb, row, dt['L'], f"='{dl}'!A{row}", red=not present, bold=is_tot)
             for j in range(nM):
-                put(comb, row, det_M0 + j, f"='{dl}'!{get_column_letter(2 + j)}{row}", red=not p26, bold=is_tot).number_format = CUR
-            put(comb, row, det_T, f"='{dl}'!{get_column_letter(2 + nM)}{row}", red=not p26, bold=is_tot).number_format = CUR
-        if not is_tot and detail:
-            comb.cell(row, RECON,
-                      f'=IF(ABS({get_column_letter(det_T)}{row}-SUM({get_column_letter(det_M0)}{row}:{get_column_letter(det_M0+nM-1)}{row}))<0.01,"ok","CHECK")')
+                put(comb, row, dt['M0'] + j, f"='{dl}'!{get_column_letter(2 + j)}{row}", red=not present, bold=is_tot).number_format = CUR
+            put(comb, row, dt['T'], f"='{dl}'!{get_column_letter(2 + nM)}{row}", red=not present, bold=is_tot).number_format = CUR
+            if not is_tot:
+                TL, M0L = get_column_letter(dt['T']), get_column_letter(dt['M0'])
+                MNL = get_column_letter(dt['M0'] + nM - 1)
+                comb.cell(row, dt['RECON'],
+                          f'=IF(ABS({TL}{row}-SUM({M0L}{row}:{MNL}{row}))<0.01,"ok","CHECK")')
         # compact year-over-year mirror (same-sheet references, keeps red cues)
         for k, (cc, srcc, _hdr) in enumerate(CMP):
             if k < len(summaries):
                 redf = not (C(label) in smaps[k] or r.get('_only') == summaries[k]['label'])
             else:
-                redf = not p26
+                redf = not dpres[k - len(summaries)]
             put(comb, row, cc, f"={get_column_letter(srcc)}{row}", red=redf, bold=is_tot).number_format = CUR
 
-    _format(comb, sum_blocks, det_L, det_M0, det_T, nM, RECON, detail is not None,
-            total_rows, blanks, grays)
+    _format(comb, sum_blocks, [dt['L'] for dt in dets], total_rows, blanks, grays)
     for si, (_, ws) in enumerate(stabs):
         _format_src(ws, list(range(2, 2 + ncols[si])))
-    if detail:
-        _format_src(dtab, list(range(2, 2 + nM + 1)))
+    for dt in dets:
+        _format_src(dt['tab'], list(range(2, 2 + dt['nM'] + 1)))
 
+    # the SUMIF block downstream reads one value column — the newest monthly
+    # statement when there is one, else the newest summary
+    last = dets[-1] if dets else None
     return {
         'title': combined_title,
         'first_row': 2, 'last_row': len(spine) + 1,
         'cls_letter': 'A',
-        'val_letter': (get_column_letter(det_T) if detail
+        'val_letter': (get_column_letter(last['T']) if last
                        else (get_column_letter(sum_val_cols[-1]) if sum_val_cols else None)),
-        'val_months': nM if detail else 12,
-        'val_label': detail['label'] if detail else (summaries[-1]['label'] if summaries else ''),
+        'val_months': last['nM'] if last else 12,
+        'val_label': last['d']['label'] if last else (summaries[-1]['label'] if summaries else ''),
     }
 
 
@@ -552,8 +601,7 @@ def _format_src(ws, vcols):
         ws.column_dimensions[get_column_letter(c)].width = 11
 
 
-def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, RECON, has_detail,
-            total_rows=(), blanks=(), grays=()):
+def _format(comb, sum_blocks, det_label_cols=(), total_rows=(), blanks=(), grays=()):
     blanks, grays = set(blanks), set(grays)
     skip = blanks | grays
     GRAY = PatternFill('solid', fgColor='BFBFBF')
@@ -575,8 +623,8 @@ def _format(comb, sum_blocks, det_L, det_M0, det_T, nM, RECON, has_detail,
     comb.column_dimensions['A'].width = 18
     for si, Lc, Vc in sum_blocks:
         comb.column_dimensions[get_column_letter(Lc)].width = 22
-    if has_detail:
-        comb.column_dimensions[get_column_letter(det_L)].width = 24
+    for c in det_label_cols:
+        comb.column_dimensions[get_column_letter(c)].width = 24
 
     # Emphasize total/subtotal/net rows: a light band + a thin top rule so they
     # read as summary lines (bold is already applied per-cell during the build).

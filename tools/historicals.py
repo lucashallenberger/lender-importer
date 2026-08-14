@@ -62,15 +62,15 @@ def render():
     if not st.button("Build workbook", type="primary"):
         return
 
-    summaries, detail = [], None
+    summaries, details = [], []
     ai_extracted, from_sheets = [], []
     with st.spinner("Parsing statements & assembling…" + (" (AI assist on)" if ai_on else "")):
         for label, kind, data in items:
             try:
                 if tabular.is_spreadsheet(data):
                     # the regex parsers read PDF text layouts; workbooks go to Claude,
-                    # which reads every period column — a monthly grid (T-12) becomes
-                    # the detail statement automatically
+                    # which reads every period column — a monthly grid (T-12) keeps
+                    # its months, however many of them arrive
                     if not ai_on:
                         st.error(f"'{label}' is a spreadsheet — reading it needs "
                                  "ANTHROPIC_API_KEY set in the app secrets.")
@@ -79,12 +79,8 @@ def render():
                     periods, rows = got.get("periods") or [], got.get("rows") or []
                     det = S.detail_from_periods(periods, rows)
                     from_sheets.append(label + (" (monthly)" if det else ""))
-                    if det and detail:
-                        st.warning(f"'{detail['label']}' is already the monthly statement — "
-                                   f"'{label}' goes in as a single column instead.")
-                        det = None
                     if det:
-                        detail = {"label": label, **det}
+                        details.append({"label": label, **det})
                     else:
                         summaries.append({"label": label,
                                           "rows": S.summary_from_periods(periods, rows)})
@@ -103,12 +99,8 @@ def render():
                         rows = hist_llm.extract_statement(data)
                         ai_extracted.append(label)
                         summaries.append({"label": label, "rows": rows})
-                    elif detail:
-                        st.warning(f"'{detail['label']}' is already the detail statement — "
-                                   f"'{label}' would replace it. Keeping the first; set "
-                                   f"'{label}' to summary if you want both.")
                     else:
-                        detail = {"label": label, **d}
+                        details.append({"label": label, **d})
             except Exception as e:  # noqa: BLE001
                 st.error(f"Could not parse '{label}': {e}")
                 return
@@ -119,7 +111,12 @@ def render():
             st.warning("Two or more statements share the label " +
                        ", ".join(f"'{d}'" for d in dupes) + " — their columns will be "
                        "indistinguishable on the combined tab. Give them distinct labels above.")
-        xlsx = S.build_workbook(summaries, detail)
+        xlsx = S.build_workbook(summaries, details)
+    if S.LAST_LLM_ERROR:
+        st.warning("The AI pass failed, so the combined tab fell back to the built-in rules — "
+                   "category names aren't aligned across years, line items aren't classified, "
+                   "and total rows aren't bolded. The numbers themselves are unaffected.\n\n"
+                   f"`{S.LAST_LLM_ERROR}`")
     if ai_extracted:
         st.info("Read by AI (built-in parser couldn't handle the format): " + ", ".join(ai_extracted)
                 + ". Double-check these against the source PDFs.")
@@ -128,12 +125,15 @@ def render():
                 + ". Double-check these against the original workbook.")
 
     st.success(f"Built — {len(summaries)} summary statement(s)"
-               + (f" + 1 detail ({len(detail['months'])} months)" if detail else "") + ".")
-    if detail:
-        recon = [c for c in detail["cats"]
-                 if abs(round(sum(detail["cats"][c].values()), 2) - detail["totals"].get(c, sum(detail["cats"][c].values()))) >= 0.01]
+               + "".join(f" + {d['label']} month-by-month ({len(d['months'])} months)"
+                         for d in sorted(details, key=lambda d: d['label']))
+               + ".")
+    for d in sorted(details, key=lambda d: d["label"]):
+        cats, tots = d["cats"], d["totals"] or {}
+        recon = [c for c in cats
+                 if abs(round(sum(cats[c].values()), 2) - tots.get(c, sum(cats[c].values()))) >= 0.01]
         if recon:
-            st.warning("Categories where the monthly sum ≠ the printed total (review these — likely "
-                       "manual/cash-basis adjustments): " + ", ".join(recon))
+            st.warning(f"{d['label']} — categories where the monthly sum ≠ the printed total "
+                       "(review these — likely manual/cash-basis adjustments): " + ", ".join(recon))
     st.download_button("⬇  Download workbook (.xlsx)", data=xlsx, file_name="Historicals.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
