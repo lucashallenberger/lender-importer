@@ -9,7 +9,6 @@ Flow the UI drives:
 
 import io
 import contextlib
-import configparser
 import os
 
 import import_lenders as il
@@ -73,12 +72,17 @@ class Api:
         being unable to read the Deal Source object are different problems with
         different fixes, and the caller has to be able to tell them apart.
         """
-        cfg = configparser.ConfigParser()
-        cfg["salesforce"] = {
-            "username": username or "", "password": password or "",
-            "security_token": security_token or "", "domain": domain or "login",
+        # A plain dict, not a ConfigParser: these credentials were typed in a
+        # browser and never go near a file. ConfigParser reads "%" as
+        # interpolation syntax and raises on a password containing one, before
+        # the login is even attempted.
+        cfg = {
+            "salesforce": {
+                "username": username or "", "password": password or "",
+                "security_token": security_token or "", "domain": domain or "login",
+            },
+            "object": {"api_name": os.environ.get("SF_OBJECT", "ascendix__DealSource__c")},
         }
-        cfg["object"] = {"api_name": os.environ.get("SF_OBJECT", "ascendix__DealSource__c")}
         try:
             self.sf = _silent(sf_login, cfg)
         except Exception as e:  # noqa: BLE001 - keep the Salesforce code intact

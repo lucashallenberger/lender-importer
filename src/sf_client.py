@@ -20,7 +20,7 @@ def _env_config():
     Used by the web/server deploy where there's no config.ini on disk."""
     if not os.environ.get("SF_USERNAME"):
         return None
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg["salesforce"] = {
         "username": os.environ["SF_USERNAME"],
         "password": os.environ.get("SF_PASSWORD", ""),
@@ -37,7 +37,7 @@ def config_exists():
 
 def save_config(username, password, security_token, domain, api_name=""):
     """Write/replace config.ini (used by the app's Settings screen)."""
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg["salesforce"] = {
         "username": username, "password": password,
         "security_token": security_token, "domain": domain or "login",
@@ -59,7 +59,7 @@ def load_config():
             "  Web deploy: set SF_USERNAME / SF_PASSWORD / SF_TOKEN / SF_DOMAIN secrets.\n"
             "  Local: copy config.example.ini to config.ini and fill it in."
         )
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(interpolation=None)
     cfg.read(path)
     return cfg
 
