@@ -13,7 +13,8 @@ import configparser
 import os
 
 import import_lenders as il
-from src.sf_client import connect, load_config, config_exists, save_config, get_object_api_name
+from src.sf_client import (connect, login as sf_login, load_config, config_exists,
+                          save_config, get_object_api_name)
 from learned_store import load_learned, remember_account, remember_contact
 from fuzzy import closest_matches
 
@@ -65,7 +66,13 @@ class Api:
 
     def connect_with(self, username, password, security_token, domain):
         """Connect using credentials supplied at runtime (web login form).
-        Nothing is written to disk - the session lives only on this Api instance."""
+        Nothing is written to disk - the session lives only on this Api instance.
+
+        Failures come back with the Salesforce fault code in "code" and the
+        step that failed in "stage" ("login" or "object"). Signing in and then
+        being unable to read the Deal Source object are different problems with
+        different fixes, and the caller has to be able to tell them apart.
+        """
         cfg = configparser.ConfigParser()
         cfg["salesforce"] = {
             "username": username or "", "password": password or "",
@@ -73,16 +80,24 @@ class Api:
         }
         cfg["object"] = {"api_name": os.environ.get("SF_OBJECT", "ascendix__DealSource__c")}
         try:
-            self.sf = _silent(connect, cfg)
+            self.sf = _silent(sf_login, cfg)
+        except Exception as e:  # noqa: BLE001 - keep the Salesforce code intact
+            self.sf = None
+            return {"ok": False, "stage": "login",
+                    "code": getattr(e, "code", None) or type(e).__name__,
+                    "error": str(getattr(e, "auth_message", None) or e)}
+        try:
             self.api_name = cfg["object"]["api_name"]
             self.desc = il.describe_object(self.sf, self.api_name)
-            return {"ok": True, "object": self.api_name}
         except SystemExit as e:
             self.sf = None
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "stage": "object", "code": "DESCRIBE_FAILED",
+                    "error": str(e)}
         except Exception as e:  # noqa: BLE001
             self.sf = None
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "stage": "object", "code": type(e).__name__,
+                    "error": str(e)}
+        return {"ok": True, "object": self.api_name}
 
     # ---- inputs -------------------------------------------------------------
     def load_excel(self, path, sheet=None):

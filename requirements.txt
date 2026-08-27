@@ -1,14 +1,20 @@
-streamlit
-pdfplumber
-openpyxl
-xlrd>=2.0
-pymupdf
-pandas
-pytesseract
-pillow
-simple-salesforce>=1.12
-streamlit-local-storage
-streamlit-sortables
+# Pinned deliberately. Streamlit Community Cloud reinstalls from this file on
+# every rebuild, so anything left open floats to whatever released that week and
+# the app changes underneath us with no commit to point at. These are the
+# versions the app is known to run on; bump them on purpose, not by accident.
+streamlit==1.58.0
+pandas==3.0.3
+openpyxl==3.1.5
+xlrd==2.0.2
+pdfplumber==0.11.10
+pymupdf==1.27.2.3
+pytesseract==0.3.13
+pillow==12.2.0
+simple-salesforce==1.12.9
+# unmaintained; the 'remember me' and sidebar-order components both ride on it,
+# and every call into it is wrapped because a Streamlit bump can break it
+streamlit-local-storage==0.0.25
+streamlit-sortables==0.3.1
 # every Claude call passes output_config= (structured outputs), which older SDKs
 # reject with a TypeError before the request is ever sent
-anthropic>=0.117
+anthropic==0.117.0

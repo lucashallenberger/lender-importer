@@ -64,8 +64,13 @@ def load_config():
     return cfg
 
 
-def connect(cfg=None):
-    """Return a logged-in Salesforce client using config.ini credentials."""
+def login(cfg=None):
+    """Log in and return a Salesforce client, letting the original exception out.
+
+    connect() below wraps this in a friendly message for the command-line tools.
+    The web sign-in form does not: it needs the real Salesforce fault code
+    (INVALID_LOGIN, API_DISABLED_FOR_ORG, ...) to tell the user what to fix.
+    """
     if cfg is None:
         cfg = load_config()
     sf_cfg = cfg["salesforce"]
@@ -76,7 +81,7 @@ def connect(cfg=None):
     domain = sf_cfg.get("domain", "login").strip() or "login"
 
     if not username or not password:
-        sys.exit("ERROR: username and password must be set in config.ini")
+        raise ValueError("Username and password are both required.")
 
     kwargs = dict(username=username, password=password, security_token=token)
 
@@ -92,8 +97,15 @@ def connect(cfg=None):
             d = d[: -len(".salesforce.com")]
         kwargs["domain"] = d
 
+    return Salesforce(**kwargs)
+
+
+def connect(cfg=None):
+    """Return a logged-in Salesforce client using config.ini credentials."""
     try:
-        return Salesforce(**kwargs)
+        return login(cfg)
+    except SystemExit:
+        raise                      # load_config()'s own "no credentials" exit
     except Exception as exc:  # noqa: BLE001 - surface a friendly message
         sys.exit(
             "ERROR: could not log in to Salesforce.\n"

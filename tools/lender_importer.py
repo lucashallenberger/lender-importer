@@ -34,6 +34,21 @@ def _storage():
         return None
 
 
+def _ls(ls, method, *args):
+    """Call a localStorage method, swallowing anything it throws.
+
+    'Remember me' is a convenience and the component is a third-party iframe;
+    a Streamlit upgrade underneath it must not be able to take the whole
+    sign-in page down.
+    """
+    if ls is None:
+        return None
+    try:
+        return getattr(ls, method)(*args)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _encode(d):
     return base64.b64encode(json.dumps(d).encode()).decode()
 
@@ -50,7 +65,7 @@ def _try_remembered(api, ls):
     if ls is None or st.session_state.get("lender_tried_remember"):
         return
     st.session_state["lender_tried_remember"] = True
-    blob = ls.getItem(STORE_KEY)
+    blob = _ls(ls, "getItem", STORE_KEY)
     creds = _decode(blob) if blob else None
     if creds:
         r = api.connect_with(creds.get("username"), creds.get("password"),
@@ -59,13 +74,70 @@ def _try_remembered(api, ls):
             st.session_state["lender_user"] = creds.get("username")
             st.rerun()
         else:
-            ls.deleteItem(STORE_KEY)   # stale (password/token changed)
+            _ls(ls, "deleteItem", STORE_KEY)   # stale (password/token changed)
+            # Keep it: the sign-in form explains what Salesforce objected to,
+            # rather than silently showing a blank login after a failed retry.
+            st.session_state["lender_remember_error"] = r
 
 
 def _reset():
     """Reset the import flow but keep the Salesforce session (stay signed in)."""
     for k in ("lender_stage", "lender_analyze", "lender_deal", "lender_prop"):
         st.session_state.pop(k, None)
+
+
+# Salesforce answers most bad logins with one vague code, so spell out what
+# each one actually means here — including the causes specific to running on a
+# server rather than on someone's office machine.
+_LOGIN_HINTS = {
+    "INVALID_LOGIN":
+        "Salesforce returns this for several different problems and won't say which:\n\n"
+        "- **The security token is stale.** Salesforce issues a new token every time the "
+        "password changes, including a routine expiry — the old one stops working that "
+        "day. Reset it (Salesforce → Settings → Reset My Security Token) and paste the "
+        "new one.\n"
+        "- **The login is coming from an untrusted IP.** This app runs on Streamlit "
+        "Cloud, not your office, and its outbound address changes without warning. If "
+        "your profile has Login IP Ranges set, the address below has to fall inside them.\n"
+        "- The username, password or org domain is simply wrong.",
+    "LOGIN_MUST_USE_SECURITY_TOKEN":
+        "The security token is missing or no longer valid — paste a freshly reset one.",
+    "API_DISABLED_FOR_ORG":
+        "API access is off for the org, or this user's profile is missing the "
+        "**API Enabled** permission. An admin has to grant it.",
+    "INVALID_OPERATION_WITH_EXPIRED_PASSWORD":
+        "The Salesforce password has expired. Change it in Salesforce first, then reset "
+        "the security token — changing the password invalidates the old one.",
+}
+
+
+def _egress_ip():
+    """The address Salesforce sees this app logging in from, for Login IP Ranges.
+    Best effort, asked once per session, and never fatal."""
+    if "lender_egress_ip" not in st.session_state:
+        try:
+            import requests
+            st.session_state["lender_egress_ip"] = requests.get(
+                "https://api.ipify.org", timeout=4).text.strip()
+        except Exception:  # noqa: BLE001
+            st.session_state["lender_egress_ip"] = None
+    return st.session_state["lender_egress_ip"]
+
+
+def _show_login_error(r):
+    code = r.get("code") or "error"
+    st.error(f"**Sign-in failed — {code}**\n\n{r.get('error') or 'No detail returned.'}")
+    if r.get("stage") == "object":
+        obj = os.environ.get("SF_OBJECT", "ascendix__DealSource__c")
+        st.info(f"The Salesforce login worked. Reading the `{obj}` object is what failed — "
+                "this user most likely has no access to it.")
+        return
+    hint = _LOGIN_HINTS.get(code)
+    if hint:
+        st.info(hint)
+    ip = _egress_ip()
+    if ip:
+        st.caption(f"Signing in from {ip} — the address Salesforce sees.")
 
 
 def _login(api, ls):
@@ -84,19 +156,18 @@ def _login(api, ls):
         if r["ok"]:
             st.session_state["lender_user"] = u
             if remember and ls is not None:
-                ls.setItem(STORE_KEY, _encode(
-                    {"username": u, "password": p, "security_token": t, "domain": d}))
+                # Saved on the *next* run, not here. A component call only
+                # reaches the browser if the script finishes, and the st.rerun()
+                # below aborts this one — the write would never leave.
+                st.session_state["lender_remember_creds"] = {
+                    "username": u, "password": p, "security_token": t, "domain": d}
             st.rerun()
         else:
-            st.error(r["error"])
+            _show_login_error(r)
 
 
 def _sign_out(ls):
-    if ls is not None:
-        try:
-            ls.deleteItem(STORE_KEY)
-        except Exception:
-            pass
+    _ls(ls, "deleteItem", STORE_KEY)
     for k in list(st.session_state.keys()):
         if k.startswith("lender_"):
             st.session_state.pop(k, None)
@@ -111,8 +182,16 @@ def render():
     if api.sf is None:                       # not signed in this session yet
         _try_remembered(api, ls)             # auto sign-in from saved login, if any
     if api.sf is None:
+        stale = st.session_state.pop("lender_remember_error", None)
+        if stale:                            # the saved login stopped working
+            st.warning("The login saved in this browser no longer works, so it has been "
+                       "cleared. Salesforce said:")
+            _show_login_error(stale)
         _login(api, ls)
         return
+    saving = st.session_state.pop("lender_remember_creds", None)
+    if saving is not None:                   # deferred from the sign-in run
+        _ls(ls, "setItem", STORE_KEY, _encode(saving))
     c1, c2 = st.columns([4, 1])
     c1.caption(f"Signed in as {st.session_state.get('lender_user', '?')} · {api.api_name}")
     if c2.button("Sign out"):
