@@ -1,15 +1,24 @@
 # Pinned deliberately. Streamlit Community Cloud reinstalls from this file on
 # every rebuild, so anything left open floats to whatever released that week and
-# the app changes underneath us with no commit to point at. These are the
-# versions the app is known to run on; bump them on purpose, not by accident.
-streamlit==1.58.0
-pandas==3.0.3
+# the app changes underneath us with no commit to point at.
+#
+# The markers matter: pandas 3 needs Python >= 3.11 and streamlit/pillow/pymupdf
+# need >= 3.10, and a Community Cloud app keeps whatever interpreter it was
+# created with. Without the fallbacks a hard pin doesn't just downgrade a
+# feature, it fails the install and the app never starts.
+streamlit==1.58.0; python_version >= "3.10"
+streamlit==1.40.1; python_version < "3.10"
+pandas==3.0.3; python_version >= "3.11"
+pandas==2.2.3; python_version < "3.11"
+pillow==12.2.0; python_version >= "3.10"
+pillow==11.0.0; python_version < "3.10"
+pymupdf==1.27.2.3; python_version >= "3.10"
+pymupdf==1.24.14; python_version < "3.10"
+
 openpyxl==3.1.5
 xlrd==2.0.2
 pdfplumber==0.11.10
-pymupdf==1.27.2.3
 pytesseract==0.3.13
-pillow==12.2.0
 simple-salesforce==1.12.9
 # unmaintained; the 'remember me' and sidebar-order components both ride on it,
 # and every call into it is wrapped because a Streamlit bump can break it
